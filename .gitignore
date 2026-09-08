@@ -1,0 +1,46 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 运行时配置（含本地密钥/端口，不入库）=====
+config/config.json
+
+# ===== 数据库与数据 =====
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# ===== 日志 =====
+logs/
+*.log
+
+# ===== 分析输出 / 临时结果 =====
+*.json
+!config/*.example.json
+!package.json
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== 测试 / 覆盖率 =====
+.pytest_cache/
+.coverage
+htmlcov/

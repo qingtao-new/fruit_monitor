@@ -1,0 +1,5 @@
+PySide6>=6.6.0
+PyQtGraph>=0.13.7
+paho-mqtt>=2.1.0
+numpy>=1.26.0
+pandas>=2.1.0
