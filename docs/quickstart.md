@@ -77,7 +77,60 @@ cd E:\opencode\fruit_monitor
 ### 想要更频繁的阻抗数据
 修改 `config/config.json` 里的 `simulator.impedance_interval_ms`。
 
-## 7. 推荐的最短验证流程
+## 7. 端到端链路验证（不接真实硬件）
+
+如果你想先验证“发布 -> MQTT -> PC 端接收 -> 分析”这条链路，可以按下面步骤做。
+
+### 7.1 启动一个临时 MQTT Broker
+
+本项目验证时使用了 `amqtt`。如果你已经有 `mosquitto`，也可以用 `mosquitto`。
+
+```powershell
+# 用 amqtt 作为临时 broker
+.\.venv\Scripts\amqtt.exe -d
+```
+
+如果不想留后台进程，可以在验证结束后手动停止它。
+
+### 7.2 用模拟器发布 MQTT 消息
+
+```powershell
+.\.venv\Scripts\python.exe publisher_sim.py --host 127.0.0.1 --port 1883 --gateway GW_001 --node LORA_NODE_01
+```
+
+说明：
+- 这会把模拟传感器数据和阻抗数据发到 `fruit/...` 主题
+- 主题格式必须符合 `fruit/{gateway}/{node}/{type}`
+
+### 7.3 用 PC 端接收并显示
+
+```powershell
+.\.venv\Scripts\python.exe main.py --mqtt
+```
+
+如果界面能打开并且数据能刷新，说明链路已经通了。
+
+### 7.4 验证分析模块
+
+```powershell
+.\.venv\Scripts\python.exe analysis.py --gateway GW_001 --node LORA_NODE_01 --model centroid
+```
+
+能输出预测结果，说明“数据入库 -> 特征提取 -> 模型训练 -> 预测”这条分析链路也是通的。
+
+## 8. 这次验证结果
+
+已验证通过的链路：
+
+- `amqtt` 临时 Broker 可启动
+- `publisher_sim.py` 可成功发布消息
+- `main.py --mqtt` 可启动，不报错
+- `analysis.py` 可成功训练并输出预测
+
+结论：
+- 当前版本已经可以支持“模拟器发 MQTT -> PC 页面接收 -> 分析模块处理”的完整链路
+
+## 9. 推荐的最短验证流程
 
 ```powershell
 cd E:\opencode\fruit_monitor
