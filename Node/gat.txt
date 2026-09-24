@@ -1,0 +1,1404 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <stdint.h>
+#include <string.h>
+
+// ============================================================
+// VSPI / LoRa引脚
+// ============================================================
+#define VSPI_SCK        14
+#define VSPI_MOSI       13
+#define VSPI_MISO       12
+
+#define LORA_CS         10
+#define LORA_RST         9
+#define LORA_DIO0       -1
+
+#define LORA_FREQ       433E6
+#define LORA_SF         7
+#define LORA_BW         250E3
+#define LORA_CR         5
+#define LORA_PREAMBLE   12
+
+#define LED_PIN         11
+
+// ============================================================
+// 扫频参数
+// ============================================================
+#define SWEEP_POINTS    100
+#define POINT_PER_PACK  10
+
+#define MAX_TOTAL_PKG \
+    ((SWEEP_POINTS + POINT_PER_PACK - 1) / POINT_PER_PACK)
+
+// 本轮接收超时
+#define SWEEP_TIMEOUT_MS    40000UL
+
+// ============================================================
+// ACK
+// ============================================================
+#define ACK_PKT_OK          0x01
+#define ACK_ROUND_DONE      0x02
+
+// ============================================================
+// ACK数据结构
+// ============================================================
+typedef struct __attribute__((packed))
+{
+    uint8_t magic;
+    uint8_t roundId;
+    uint8_t pkgIdx;
+    uint8_t ackFlag;
+
+} AckFrame;
+
+// ============================================================
+// 数据头
+// ============================================================
+typedef struct __attribute__((packed))
+{
+    uint8_t  magic;
+    uint8_t  roundId;
+    uint8_t  pointNum;
+    uint8_t  pkgIdx;
+    uint8_t  pkgTotal;
+
+    int16_t soil_moisture;
+    int16_t ph_x100;
+    int16_t h2s;
+    int16_t co2;
+    int16_t temp_x100;
+    int16_t humidity;
+    int16_t nh3;
+
+    char rfidId[16];
+
+} SensorHead;
+
+// ============================================================
+// 阻抗数据
+// ============================================================
+typedef struct __attribute__((packed))
+{
+    uint32_t f;
+    int16_t  re;
+    int16_t  im;
+    int32_t  Z_x100;
+
+} PointBin;
+
+// ============================================================
+// 完整100点
+// ============================================================
+PointBin fullSpectrum[
+    SWEEP_POINTS
+];
+
+// ============================================================
+// 已收到的包
+// ============================================================
+bool pkgReceivedFlag[
+    MAX_TOTAL_PKG
+];
+
+// ============================================================
+// 当前轮参数
+// ============================================================
+uint8_t currentTotalPkg = 0;
+
+uint8_t currentRoundId = 0;
+
+// 当前是否正在接收一轮
+bool activeRound = false;
+
+// ============================================================
+// 最后一轮已经完成的信息
+//
+// 用于处理：
+// 最后一包已经收到，但ROUND_DONE ACK丢失。
+// UNO会重新发送最后一包。
+// 网关不能把它当新Round。
+// ============================================================
+bool hasCompletedRound = false;
+
+uint8_t lastCompletedRoundId = 0;
+
+// ============================================================
+// 接收缓存
+// ============================================================
+uint8_t rawBuf[256];
+
+// ============================================================
+// 当前轮开始/最后一次有效接收时间
+// ============================================================
+uint32_t sweepStartMs = 0;
+
+// ============================================================
+// 当前轮第一包保存的环境数据
+//
+// 最后一包理论上环境数据相同。
+// 为了不依赖某个具体分片，专门保存一份。
+// ============================================================
+SensorHead currentRoundHead;
+
+bool hasCurrentHead = false;
+
+// ============================================================
+// 清空当前轮
+// ============================================================
+void resetCurrentRound()
+{
+    memset(
+        pkgReceivedFlag,
+        0,
+        sizeof(pkgReceivedFlag)
+    );
+
+    memset(
+        fullSpectrum,
+        0,
+        sizeof(fullSpectrum)
+    );
+
+    memset(
+        &currentRoundHead,
+        0,
+        sizeof(currentRoundHead)
+    );
+
+    currentTotalPkg = 0;
+
+    sweepStartMs = 0;
+
+    hasCurrentHead = false;
+
+    activeRound = false;
+}
+
+// ============================================================
+// 打印分片位图
+// ============================================================
+void printStatusBitmap()
+{
+    Serial.print(
+        "📋 分片接收位图："
+    );
+
+    for (
+        uint8_t i = 0;
+        i < MAX_TOTAL_PKG;
+        i++
+    )
+    {
+        Serial.print(
+            pkgReceivedFlag[i]
+            ? "1 "
+            : "0 "
+        );
+    }
+
+    Serial.println();
+}
+
+// ============================================================
+// 打印完整100点
+// ============================================================
+void printFullSweep(
+    const SensorHead &head
+)
+{
+    Serial.println();
+    Serial.println(
+        "======================================================"
+    );
+
+    Serial.println(
+        "          【本轮完整扫频数据】"
+    );
+
+    Serial.println(
+        "======================================================"
+    );
+
+    Serial.print(
+        "Round ID    : "
+    );
+
+    Serial.println(
+        head.roundId
+    );
+
+    Serial.println(
+        "---------- 传感器数据 ----------"
+    );
+
+    Serial.print(
+        "RFID_ID     : "
+    );
+
+    Serial.println(
+        head.rfidId
+    );
+
+    Serial.print(
+        "soil_moist  : "
+    );
+
+    Serial.println(
+        head.soil_moisture
+    );
+
+    Serial.print(
+        "pH          : "
+    );
+
+    Serial.println(
+        (double)head.ph_x100 /
+        100.0,
+        2
+    );
+
+    Serial.print(
+        "H2S         : "
+    );
+
+    Serial.println(
+        head.h2s
+    );
+
+    Serial.print(
+        "CO2         : "
+    );
+
+    Serial.println(
+        head.co2
+    );
+
+    Serial.print(
+        "Temperature : "
+    );
+
+    Serial.print(
+        (double)head.temp_x100 /
+        100.0,
+        2
+    );
+
+    Serial.println(
+        " ℃"
+    );
+
+    Serial.print(
+        "Humidity    : "
+    );
+
+    Serial.print(
+        head.humidity
+    );
+
+    Serial.println(
+        " %"
+    );
+
+    Serial.print(
+        "NH3         : "
+    );
+
+    Serial.println(
+        head.nh3
+    );
+
+    Serial.println(
+        "---------- 阻抗数据 ----------"
+    );
+
+    Serial.print(
+        "总点数："
+    );
+
+    Serial.println(
+        SWEEP_POINTS
+    );
+
+    for (
+        uint16_t i = 0;
+        i < SWEEP_POINTS;
+        i++
+    )
+    {
+        double Z =
+            (double)
+            fullSpectrum[i].Z_x100
+            /
+            100.0;
+
+        Serial.printf(
+            "[%d] f=%luHz  re=%d  im=%d  Z=%.2f Ω\n",
+
+            i,
+
+            (unsigned long)
+            fullSpectrum[i].f,
+
+            fullSpectrum[i].re,
+
+            fullSpectrum[i].im,
+
+            Z
+        );
+    }
+
+    Serial.println(
+        "======================================================"
+    );
+}
+
+// ============================================================
+// 同步发送：单包ACK
+//
+// 原程序这里使用endPacket(true)，会异步发送。
+// 现在改为endPacket()。
+// ============================================================
+bool sendAck(
+    uint8_t round,
+    uint8_t pkgIdx
+)
+{
+    AckFrame ackPkt;
+
+    ackPkt.magic = 0xAA;
+
+    ackPkt.roundId = round;
+
+    ackPkt.pkgIdx = pkgIdx;
+
+    ackPkt.ackFlag = ACK_PKT_OK;
+
+    LoRa.beginPacket();
+
+    LoRa.write(
+        (uint8_t*)&ackPkt,
+        sizeof(AckFrame)
+    );
+
+    // ★同步发送
+    int ret = LoRa.endPacket();
+
+    if (ret == 0)
+    {
+        Serial.println(
+            "❌ 单包ACK发送失败"
+        );
+
+        return false;
+    }
+
+    Serial.printf(
+        "📤 回复ACK  Round:%d  Pkg:%d\n",
+        round,
+        pkgIdx + 1
+    );
+
+    return true;
+}
+
+// ============================================================
+// 同步发送：整轮完成ACK
+// ============================================================
+bool sendRoundDoneAck(
+    uint8_t round
+)
+{
+    AckFrame ackPkt;
+
+    ackPkt.magic = 0xAA;
+
+    ackPkt.roundId = round;
+
+    ackPkt.pkgIdx = 0xFF;
+
+    ackPkt.ackFlag =
+        ACK_ROUND_DONE;
+
+    LoRa.beginPacket();
+
+    LoRa.write(
+        (uint8_t*)&ackPkt,
+        sizeof(AckFrame)
+    );
+
+    // ★同步发送
+    int ret = LoRa.endPacket();
+
+    if (ret == 0)
+    {
+        Serial.println(
+            "❌ 整轮ACK发送失败"
+        );
+
+        return false;
+    }
+
+    Serial.printf(
+        "📤【整轮完成ACK】Round:%d\n",
+        round
+    );
+
+    return true;
+}
+
+// ============================================================
+// 判断一个包是不是“上一轮已经完成的数据包”
+//
+// 用于：
+// UNO已经收到分片ACK，但没收到整轮ACK。
+// UNO重新发送最后一包。
+// 网关要：
+//     回复单包ACK
+//     再回复整轮ACK
+// 但绝不能重新创建一个新Round。
+// ============================================================
+bool isLastCompletedRound(
+    uint8_t round
+)
+{
+    return
+        hasCompletedRound &&
+        round == lastCompletedRoundId;
+}
+
+// ============================================================
+// 启动一轮新Round
+// ============================================================
+void startNewRoundFromPacket(
+    SensorHead &head
+)
+{
+    resetCurrentRound();
+
+    currentRoundId =
+        head.roundId;
+
+    currentTotalPkg =
+        head.pkgTotal;
+
+    sweepStartMs =
+        millis();
+
+    activeRound = true;
+
+    currentRoundHead =
+        head;
+
+    hasCurrentHead = true;
+
+    Serial.println();
+
+    Serial.println(
+        "📌 开启新一轮扫频"
+    );
+
+    Serial.print(
+        "Round = "
+    );
+
+    Serial.println(
+        currentRoundId
+    );
+
+    Serial.print(
+        "总包数 = "
+    );
+
+    Serial.println(
+        currentTotalPkg
+    );
+}
+
+// ============================================================
+// 检查数据包是否合法
+// ============================================================
+bool validateDataPacket(
+    int pktLen,
+    SensorHead &head
+)
+{
+    // --------------------------------------------------------
+    // 最小长度
+    // --------------------------------------------------------
+    if (
+        pktLen <
+        (int)sizeof(SensorHead)
+    )
+    {
+        Serial.println(
+            "⚠️ 数据包太短"
+        );
+
+        return false;
+    }
+
+    // --------------------------------------------------------
+    // 魔数
+    // --------------------------------------------------------
+    if (
+        head.magic != 0xAA
+    )
+    {
+        Serial.println(
+            "⚠️ 魔数错误"
+        );
+
+        return false;
+    }
+
+    // --------------------------------------------------------
+    // pkgTotal
+    // --------------------------------------------------------
+    if (
+        head.pkgTotal !=
+        MAX_TOTAL_PKG
+    )
+    {
+        Serial.print(
+            "⚠️ pkgTotal错误："
+        );
+
+        Serial.println(
+            head.pkgTotal
+        );
+
+        return false;
+    }
+
+    // --------------------------------------------------------
+    // pkgIdx
+    // --------------------------------------------------------
+    if (
+        head.pkgIdx >=
+        MAX_TOTAL_PKG
+    )
+    {
+        Serial.print(
+            "⚠️ 非法pkgIdx："
+        );
+
+        Serial.println(
+            head.pkgIdx
+        );
+
+        return false;
+    }
+
+    // --------------------------------------------------------
+    // 点数
+    // --------------------------------------------------------
+    if (
+        head.pointNum == 0 ||
+        head.pointNum > POINT_PER_PACK
+    )
+    {
+        Serial.print(
+            "⚠️ 非法pointNum："
+        );
+
+        Serial.println(
+            head.pointNum
+        );
+
+        return false;
+    }
+
+    // --------------------------------------------------------
+    // 对于前9个包，必须正好10点
+    // --------------------------------------------------------
+    if (
+        head.pkgIdx <
+        MAX_TOTAL_PKG - 1
+    )
+    {
+        if (
+            head.pointNum !=
+            POINT_PER_PACK
+        )
+        {
+            Serial.println(
+                "⚠️ 非最后一包却不是10点"
+            );
+
+            return false;
+        }
+    }
+
+    // --------------------------------------------------------
+    // 计算理论长度
+    // --------------------------------------------------------
+    size_t expectLen =
+        sizeof(SensorHead)
+        +
+        head.pointNum *
+        sizeof(PointBin);
+
+    if (
+        pktLen !=
+        (int)expectLen
+    )
+    {
+        Serial.print(
+            "⚠️ 包长度不匹配，预期="
+        );
+
+        Serial.print(
+            expectLen
+        );
+
+        Serial.print(
+            " 实际="
+        );
+
+        Serial.println(
+            pktLen
+        );
+
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================
+// 处理已经完成Round的重复包
+// ============================================================
+void handleDuplicateFromCompletedRound(
+    SensorHead &head
+)
+{
+    Serial.println();
+
+    Serial.println(
+        "🔁 收到上一轮重复数据包"
+    );
+
+    Serial.print(
+        "Round="
+    );
+
+    Serial.println(
+        head.roundId
+    );
+
+    Serial.print(
+        "Pkg="
+    );
+
+    Serial.println(
+        head.pkgIdx + 1
+    );
+
+    // --------------------------------------------------------
+    // 重新回复该分片ACK
+    // --------------------------------------------------------
+    sendAck(
+        head.roundId,
+        head.pkgIdx
+    );
+
+    // --------------------------------------------------------
+    // 再次回复整轮ACK
+    // --------------------------------------------------------
+    sendRoundDoneAck(
+        head.roundId
+    );
+
+    Serial.println(
+        "✅ 已重新回复分片ACK + 整轮ACK"
+    );
+}
+
+// ============================================================
+// setup
+// ============================================================
+void setup()
+{
+    Serial.begin(9600);
+
+    delay(300);
+
+    Serial.println();
+    Serial.println(
+        "================================================"
+    );
+
+    Serial.println(
+        " ESP32-S3网关：分片重组接收"
+    );
+
+    Serial.println(
+        " 通信模式：同步ACK + 停等ARQ"
+    );
+
+    Serial.println(
+        "================================================"
+    );
+
+    pinMode(
+        LED_PIN,
+        OUTPUT
+    );
+
+    digitalWrite(
+        LED_PIN,
+        LOW
+    );
+
+    // ========================================================
+    // SPI
+    // ========================================================
+    SPI.begin(
+        VSPI_SCK,
+        VSPI_MISO,
+        VSPI_MOSI
+    );
+
+    // ========================================================
+    // LoRa Reset
+    // ========================================================
+    pinMode(
+        LORA_RST,
+        OUTPUT
+    );
+
+    digitalWrite(
+        LORA_RST,
+        LOW
+    );
+
+    delay(10);
+
+    digitalWrite(
+        LORA_RST,
+        HIGH
+    );
+
+    delay(20);
+
+    // ========================================================
+    // LoRa
+    // ========================================================
+    LoRa.setPins(
+        LORA_CS,
+        LORA_RST,
+        LORA_DIO0
+    );
+
+    if (
+        !LoRa.begin(
+            LORA_FREQ
+        )
+    )
+    {
+        Serial.println(
+            "❌ LoRa初始化失败！"
+        );
+
+        while (1)
+        {
+            digitalWrite(
+                LED_PIN,
+                !digitalRead(
+                    LED_PIN
+                )
+            );
+
+            delay(300);
+        }
+    }
+
+    LoRa.setSpreadingFactor(
+        LORA_SF
+    );
+
+    LoRa.setSignalBandwidth(
+        LORA_BW
+    );
+
+    LoRa.setCodingRate4(
+        LORA_CR
+    );
+
+    LoRa.setPreambleLength(
+        LORA_PREAMBLE
+    );
+
+    LoRa.enableCrc();
+
+    LoRa.disableInvertIQ();
+
+    // ========================================================
+    // 初始状态
+    // ========================================================
+    resetCurrentRound();
+
+    hasCompletedRound = false;
+
+    lastCompletedRoundId = 0;
+
+    Serial.println(
+        "✅ 网关就绪，等待数据包"
+    );
+
+    Serial.print(
+        "sizeof(SensorHead) = "
+    );
+
+    Serial.println(
+        sizeof(SensorHead)
+    );
+
+    Serial.print(
+        "sizeof(PointBin) = "
+    );
+
+    Serial.println(
+        sizeof(PointBin)
+    );
+
+    Serial.print(
+        "sizeof(AckFrame) = "
+    );
+
+    Serial.println(
+        sizeof(AckFrame)
+    );
+}
+
+// ============================================================
+// loop
+// ============================================================
+void loop()
+{
+    unsigned long now =
+        millis();
+
+    // ========================================================
+    // 当前轮接收超时
+    //
+    // 这里只针对“正在接收中的Round”
+    // ========================================================
+    if (
+        activeRound &&
+        sweepStartMs != 0
+    )
+    {
+        if (
+            now - sweepStartMs >
+            SWEEP_TIMEOUT_MS
+        )
+        {
+            Serial.println();
+
+            Serial.print(
+                "⏱️ Round "
+            );
+
+            Serial.print(
+                currentRoundId
+            );
+
+            Serial.println(
+                " 接收超时"
+            );
+
+            printStatusBitmap();
+
+            Serial.println(
+                "⚠️ 丢弃当前未完成Round"
+            );
+
+            resetCurrentRound();
+        }
+    }
+
+    // ========================================================
+    // 接收LoRa包
+    // ========================================================
+    int pktLen =
+        LoRa.parsePacket();
+
+    if (pktLen <= 0)
+    {
+        return;
+    }
+
+    // ========================================================
+    // 防止超出缓存
+    // ========================================================
+    if (pktLen >
+        (int)sizeof(rawBuf))
+    {
+        Serial.println(
+            "⚠️ 数据包超过接收缓存"
+        );
+
+        while (LoRa.available())
+        {
+            LoRa.read();
+        }
+
+        return;
+    }
+
+    // ========================================================
+    // 清空缓存
+    // ========================================================
+    memset(
+        rawBuf,
+        0,
+        sizeof(rawBuf)
+    );
+
+    // ========================================================
+    // 读取整个数据包
+    // ========================================================
+    int readLen =
+        LoRa.readBytes(
+            rawBuf,
+            pktLen
+        );
+
+    if (
+        readLen != pktLen
+    )
+    {
+        Serial.println(
+            "⚠️ 数据包读取不完整"
+        );
+
+        return;
+    }
+
+    Serial.println();
+    Serial.print(
+        "📥 收到数据包，长度="
+    );
+
+    Serial.print(
+        pktLen
+    );
+
+    Serial.print(
+        " RSSI="
+    );
+
+    Serial.println(
+        LoRa.packetRssi()
+    );
+
+    // ========================================================
+    // 最小包长
+    // ========================================================
+    if (
+        pktLen <
+        (int)sizeof(SensorHead)
+    )
+    {
+        Serial.println(
+            "⚠️ 数据包太短，丢弃"
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // 不直接强转后使用
+    // 复制到本地结构，避免后续缓存处理造成误读
+    // ========================================================
+    SensorHead head;
+
+    memset(
+        &head,
+        0,
+        sizeof(head)
+    );
+
+    memcpy(
+        &head,
+        rawBuf,
+        sizeof(SensorHead)
+    );
+
+    // ========================================================
+    // 校验数据包
+    // ========================================================
+    if (
+        !validateDataPacket(
+            pktLen,
+            head
+        )
+    )
+    {
+        return;
+    }
+
+    // ========================================================
+    // 信息打印
+    // ========================================================
+    Serial.print(
+        "分片："
+    );
+
+    Serial.print(
+        head.pkgIdx + 1
+    );
+
+    Serial.print(
+        "/"
+    );
+
+    Serial.print(
+        head.pkgTotal
+    );
+
+    Serial.print(
+        " Round:"
+    );
+
+    Serial.print(
+        head.roundId
+    );
+
+    Serial.print(
+        " 点数:"
+    );
+
+    Serial.println(
+        head.pointNum
+    );
+
+    // ========================================================
+    // 情况1：
+    // 这一包来自刚刚已经完成的上一轮
+    //
+    // 一般发生在：
+    // UNO没收到ROUND_DONE，重传最后一包。
+    // ========================================================
+    if (
+        !activeRound &&
+        isLastCompletedRound(
+            head.roundId
+        )
+    )
+    {
+        handleDuplicateFromCompletedRound(
+            head
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // 情况2：
+    // 当前没有正在接收的Round
+    //
+    // 建立新Round
+    // ========================================================
+    if (!activeRound)
+    {
+        startNewRoundFromPacket(
+            head
+        );
+    }
+
+    // ========================================================
+    // 当前Round不匹配
+    // ========================================================
+    if (
+        head.roundId !=
+        currentRoundId
+    )
+    {
+        Serial.print(
+            "⚠️ Round不匹配：当前="
+        );
+
+        Serial.print(
+            currentRoundId
+        );
+
+        Serial.print(
+            " 收到="
+        );
+
+        Serial.println(
+            head.roundId
+        );
+
+        Serial.println(
+            "⚠️ 丢弃该包，不发送ACK"
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // 当前Round总包数检查
+    // ========================================================
+    if (
+        head.pkgTotal !=
+        currentTotalPkg
+    )
+    {
+        Serial.println(
+            "⚠️ 当前Round总包数不一致"
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // 重复分片
+    // ========================================================
+    if (
+        pkgReceivedFlag[
+            head.pkgIdx
+        ]
+    )
+    {
+        Serial.print(
+            "🔁 重复分片："
+        );
+
+        Serial.println(
+            head.pkgIdx + 1
+        );
+
+        // ---------------------------------------------
+        // 重复包必须ACK。
+        // 因为很可能是：
+        // 网关之前已经收到，
+        // 但UNO没有收到ACK。
+        // ---------------------------------------------
+        sendAck(
+            head.roundId,
+            head.pkgIdx
+        );
+
+        // 如果已经全部完成，
+        // 再次发送整轮ACK。
+        bool allDone = true;
+
+        for (
+            uint8_t i = 0;
+            i < currentTotalPkg;
+            i++
+        )
+        {
+            if (
+                !pkgReceivedFlag[i]
+            )
+            {
+                allDone = false;
+                break;
+            }
+        }
+
+        if (allDone)
+        {
+            sendRoundDoneAck(
+                currentRoundId
+            );
+        }
+
+        return;
+    }
+
+    // ========================================================
+    // 取得阻抗数据地址
+    // ========================================================
+    PointBin *pRecv =
+        (PointBin*)
+        (
+            rawBuf +
+            sizeof(SensorHead)
+        );
+
+    // ========================================================
+    // 分片起始位置
+    // ========================================================
+    uint16_t basePos =
+        head.pkgIdx *
+        POINT_PER_PACK;
+
+    // ========================================================
+    // 防止越界
+    // ========================================================
+    if (
+        basePos +
+        head.pointNum >
+        SWEEP_POINTS
+    )
+    {
+        Serial.println(
+            "⚠️ 数据写入越界，丢弃"
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // 保存环境数据
+    //
+    // 第一包收到时保存。
+    // ========================================================
+    if (!hasCurrentHead)
+    {
+        currentRoundHead =
+            head;
+
+        hasCurrentHead = true;
+    }
+
+    // ========================================================
+    // 拷贝阻抗点
+    // ========================================================
+    for (
+        uint8_t i = 0;
+        i < head.pointNum;
+        i++
+    )
+    {
+        fullSpectrum[
+            basePos + i
+        ] = pRecv[i];
+    }
+
+    // ========================================================
+    // 标记这个包已经收到
+    // ========================================================
+    pkgReceivedFlag[
+        head.pkgIdx
+    ] = true;
+
+    // ========================================================
+    // 刷新当前Round超时计时器
+    // ========================================================
+    sweepStartMs =
+        millis();
+
+    // ========================================================
+    // 回单包ACK
+    //
+    // ★同步发送完成以后，
+    // 才继续后续流程。
+    // ========================================================
+    if (
+        !sendAck(
+            head.roundId,
+            head.pkgIdx
+        )
+    )
+    {
+        Serial.println(
+            "⚠️ 单包ACK发送失败"
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // 打印当前位图
+    // ========================================================
+    printStatusBitmap();
+
+    // ========================================================
+    // 判断是不是全部收到
+    // ========================================================
+    bool allDone = true;
+
+    for (
+        uint8_t i = 0;
+        i < currentTotalPkg;
+        i++
+    )
+    {
+        if (
+            !pkgReceivedFlag[i]
+        )
+        {
+            allDone = false;
+            break;
+        }
+    }
+
+    // ========================================================
+    // 如果没有收齐
+    // ========================================================
+    if (!allDone)
+    {
+        Serial.println(
+            "⏳ 本轮尚未收齐，继续等待下一分片"
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // ================= ALL DONE =============================
+    // ========================================================
+    Serial.println();
+    Serial.println(
+        "✅✅✅ 所有分片已经收到"
+    );
+
+    Serial.print(
+        "Round="
+    );
+
+    Serial.print(
+        currentRoundId
+    );
+
+    Serial.println(
+        " 100点全部收齐"
+    );
+
+    // ========================================================
+    // 先打印完整数据
+    // ========================================================
+    printFullSweep(
+        currentRoundHead
+    );
+
+    // ========================================================
+    // 保存“已经完成的Round”
+    //
+    // 这样UNO如果没收到整轮ACK，
+    // 重传最后一个包时，
+    // 网关不会把它误判成新Round。
+    // ========================================================
+    lastCompletedRoundId =
+        currentRoundId;
+
+    hasCompletedRound = true;
+
+    // ========================================================
+    // 发送整轮完成ACK
+    // ========================================================
+    sendRoundDoneAck(
+        currentRoundId
+    );
+
+    // ========================================================
+    // 清空当前Round
+    // ========================================================
+    resetCurrentRound();
+
+    Serial.println();
+    Serial.println(
+        "✅ 本Round正式结束"
+    );
+
+    Serial.println(
+        "⏳ 等待UNO下一Round"
+    );
+}

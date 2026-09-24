@@ -1,0 +1,1097 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_SHT31.h>
+#include <math.h>
+
+// ============================================================
+// LoRa
+// ============================================================
+#define SS_PIN      10
+#define RST_PIN      9
+#define DIO0_PIN     8
+#define LED_PIN      6
+
+#define FREQ         433E6
+#define SF           7
+#define BW           250E3
+#define CR           5
+#define PREAMBLE     12
+
+// ============================================================
+// 传感器
+// ============================================================
+#define SOIL_PIN     A0
+#define MQ137_PIN    A1
+#define MQ136_PIN    A2
+#define PH_PIN       A3
+#define GP30_CO2_PIN A6
+
+#define SOIL_DRY     1023
+#define SOIL_WET     300
+
+#define MQ137_CLEAN_AIR 200
+#define MQ136_CLEAN_AIR 150
+
+#define PH_OFFSET    21.677
+#define PH_ARRAY_LEN 40
+
+#define GP30_ZERO_ADC 120
+#define GP30_FULL_ADC 920
+#define CO2_FULL_PPM  5000
+
+#define NODE_ID "LORA_NODE_01"
+
+// ============================================================
+// ACK
+// ============================================================
+#define ACK_PKT_OK      0x01
+#define ACK_ROUND_DONE  0x02
+
+#define ACK_TIMEOUT        1500UL
+#define MAX_RETRY          5
+#define ROUND_WAIT_TIMEOUT 45000UL
+
+// ============================================================
+// 扫频
+// ============================================================
+#define START_FREQ_HZ 1000UL
+#define FREQ_STEP_HZ  100UL
+
+#define SWEEP_POINTS   100
+#define POINT_PER_PACK 10
+#define TOTAL_PACKETS  10
+
+// ============================================================
+// 校准
+// ============================================================
+const float calGain = 1.234e-6f;
+
+// ============================================================
+// ACK帧
+// ============================================================
+typedef struct __attribute__((packed))
+{
+    uint8_t magic;
+    uint8_t roundId;
+    uint8_t pkgIdx;
+    uint8_t ackFlag;
+} AckFrame;
+
+// ============================================================
+// 数据头
+// ============================================================
+typedef struct __attribute__((packed))
+{
+    uint8_t  magic;
+    uint8_t  roundId;
+    uint8_t  pointNum;
+    uint8_t  pkgIdx;
+    uint8_t  pkgTotal;
+
+    int16_t soil_moisture;
+    int16_t ph_x100;
+    int16_t h2s;
+    int16_t co2;
+    int16_t temp_x100;
+    int16_t humidity;
+    int16_t nh3;
+
+    char rfidId[16];
+} SensorHead;
+
+// ============================================================
+// 一个阻抗点
+// ============================================================
+typedef struct __attribute__((packed))
+{
+    uint32_t f;
+    int16_t  re;
+    int16_t  im;
+    int32_t  Z_x100;
+} PointBin;
+
+// ============================================================
+// 外设
+// ============================================================
+Adafruit_SHT31 sht31;
+
+// ============================================================
+// pH缓存
+// 40 * 2 = 80字节
+// ============================================================
+int pHArray[PH_ARRAY_LEN];
+
+uint8_t pHIndex = 0;
+
+unsigned long lastPHTime = 0;
+
+// ============================================================
+// 环境数据
+// ============================================================
+int16_t soil_moisture = 0;
+int16_t ph_x100 = 0;
+int16_t h2s = 0;
+int16_t co2 = 0;
+int16_t temp_x100 = 0;
+int16_t humidity = 0;
+int16_t nh3 = 0;
+
+// ============================================================
+// 当前分片
+//
+// 120字节
+//
+// 必须保留：
+// ACK超时后需要重新发送同一分片。
+// ============================================================
+PointBin fragBuf[POINT_PER_PACK];
+
+// ============================================================
+// 状态
+// ============================================================
+enum WorkState
+{
+    ST_SWEEPING = 0,
+    ST_WAIT_ACK,
+    ST_WAIT_ROUND_DONE
+};
+
+uint8_t workState = ST_SWEEPING;
+
+// ============================================================
+// 当前轮
+// ============================================================
+uint8_t roundId = 0;
+
+// 当前包
+uint8_t pkgIdx = 0;
+
+// 当前分片点数
+uint8_t fragPointCnt = 0;
+
+// 已采集总点数
+uint8_t pointCnt = 0;
+
+// ACK等待开始时间
+unsigned long sendTick = 0;
+
+// 整轮ACK等待开始时间
+unsigned long roundWaitTick = 0;
+
+// 重传次数
+uint8_t retryCnt = 0;
+
+// ============================================================
+// pH平均
+// ============================================================
+float averagePH(int *arr, uint8_t num)
+{
+    if (num == 0)
+        return 0.0f;
+
+    if (num < 5)
+    {
+        long sum = 0;
+
+        for (uint8_t i = 0; i < num; i++)
+        {
+            sum += arr[i];
+        }
+
+        return (float)sum / num;
+    }
+
+    int minv = arr[0];
+    int maxv = arr[0];
+
+    long sum = 0;
+
+    for (uint8_t i = 1; i < num; i++)
+    {
+        if (arr[i] < minv)
+            minv = arr[i];
+
+        if (arr[i] > maxv)
+            maxv = arr[i];
+
+        sum += arr[i];
+    }
+
+    sum -= minv;
+    sum -= maxv;
+
+    return (float)sum / (num - 2);
+}
+
+// ============================================================
+// CO2
+// ============================================================
+int16_t readCO2()
+{
+    int adc = analogRead(GP30_CO2_PIN);
+
+    long value =
+        map(
+            adc,
+            GP30_ZERO_ADC,
+            GP30_FULL_ADC,
+            0,
+            CO2_FULL_PPM
+        );
+
+    value = constrain(
+        value,
+        0,
+        CO2_FULL_PPM
+    );
+
+    return (int16_t)value;
+}
+
+// ============================================================
+// 环境采集
+// ============================================================
+void readEnvironment()
+{
+    // --------------------------------------------------------
+    // 土壤
+    // --------------------------------------------------------
+    int soilRaw =
+        analogRead(SOIL_PIN);
+
+    soil_moisture =
+        (int16_t)constrain(
+            map(
+                soilRaw,
+                SOIL_DRY,
+                SOIL_WET,
+                0,
+                100
+            ),
+            0,
+            100
+        );
+
+    // --------------------------------------------------------
+    // NH3
+    // --------------------------------------------------------
+    int nh3Raw =
+        analogRead(MQ137_PIN);
+
+    nh3 =
+        (int16_t)constrain(
+            map(
+                nh3Raw,
+                MQ137_CLEAN_AIR,
+                1023,
+                0,
+                100
+            ),
+            0,
+            100
+        );
+
+    // --------------------------------------------------------
+    // H2S
+    // --------------------------------------------------------
+    int h2sRaw =
+        analogRead(MQ136_PIN);
+
+    h2s =
+        (int16_t)constrain(
+            map(
+                h2sRaw,
+                MQ136_CLEAN_AIR,
+                1023,
+                0,
+                50
+            ),
+            0,
+            50
+        );
+
+    // --------------------------------------------------------
+    // 温湿度
+    // --------------------------------------------------------
+    float t = sht31.readTemperature();
+    float h = sht31.readHumidity();
+
+    if (isnan(t) || isnan(h))
+    {
+        t = 25.0f;
+        h = 45.0f;
+    }
+
+    temp_x100 =
+        (int16_t)(t * 100.0f + 0.5f);
+
+    humidity =
+        (int16_t)h;
+
+    // --------------------------------------------------------
+    // pH
+    // --------------------------------------------------------
+    float voltage =
+        averagePH(
+            pHArray,
+            PH_ARRAY_LEN
+        ) * 5.0f / 1024.0f;
+
+    float ph =
+        -5.8887f * voltage
+        + PH_OFFSET;
+
+    ph =
+        constrain(
+            ph,
+            0.0f,
+            14.0f
+        );
+
+    ph_x100 =
+        (int16_t)(ph * 100.0f + 0.5f);
+
+    // --------------------------------------------------------
+    // CO2
+    // --------------------------------------------------------
+    co2 = readCO2();
+
+    // --------------------------------------------------------
+    // 简洁输出
+    // --------------------------------------------------------
+    Serial.print(F("ENV soil="));
+    Serial.print(soil_moisture);
+
+    Serial.print(F(" pH="));
+    Serial.print((float)ph_x100 / 100.0f, 2);
+
+    Serial.print(F(" T="));
+    Serial.print((float)temp_x100 / 100.0f, 2);
+
+    Serial.print(F(" RH="));
+    Serial.print(humidity);
+
+    Serial.print(F(" NH3="));
+    Serial.print(nh3);
+
+    Serial.print(F(" H2S="));
+    Serial.print(h2s);
+
+    Serial.print(F(" CO2="));
+    Serial.println(co2);
+}
+
+// ============================================================
+// 直接发送分片
+//
+// 关键：不再使用 loraPktBuf[250]
+//
+// 原来：
+// SensorHead -> loraPktBuf
+// PointBin   -> loraPktBuf
+// 然后一次发送
+//
+// 现在：
+// SensorHead -> LoRa FIFO
+// PointBin   -> LoRa FIFO
+//
+// 节省250字节RAM。
+// ============================================================
+bool sendFragment(
+    uint8_t idx,
+    uint8_t pointNum
+)
+{
+    SensorHead head;
+
+    head.magic = 0xAA;
+    head.roundId = roundId;
+    head.pointNum = pointNum;
+    head.pkgIdx = idx;
+    head.pkgTotal = TOTAL_PACKETS;
+
+    head.soil_moisture = soil_moisture;
+    head.ph_x100 = ph_x100;
+    head.h2s = h2s;
+    head.co2 = co2;
+    head.temp_x100 = temp_x100;
+    head.humidity = humidity;
+    head.nh3 = nh3;
+
+    // 直接写NODE_ID
+    strncpy(
+        head.rfidId,
+        NODE_ID,
+        15
+    );
+
+    head.rfidId[15] = '\0';
+
+    // --------------------------------------------------------
+    // 包长度
+    // --------------------------------------------------------
+    uint16_t pktLen =
+        sizeof(SensorHead)
+        +
+        pointNum * sizeof(PointBin);
+
+    Serial.print(F("TX "));
+    Serial.print(idx + 1);
+    Serial.print(F("/"));
+    Serial.print(TOTAL_PACKETS);
+    Serial.print(F(" R="));
+    Serial.print(roundId);
+    Serial.print(F(" N="));
+    Serial.print(pointNum);
+    Serial.print(F(" L="));
+    Serial.println(pktLen);
+
+    // --------------------------------------------------------
+    // LED
+    // --------------------------------------------------------
+    digitalWrite(
+        LED_PIN,
+        HIGH
+    );
+
+    // --------------------------------------------------------
+    // 开包
+    // --------------------------------------------------------
+    LoRa.beginPacket();
+
+    // 先发送头
+    LoRa.write(
+        (uint8_t*)&head,
+        sizeof(SensorHead)
+    );
+
+    // 再直接发送分片
+    LoRa.write(
+        (uint8_t*)fragBuf,
+        pointNum * sizeof(PointBin)
+    );
+
+    // --------------------------------------------------------
+    // ★ 同步发送
+    // --------------------------------------------------------
+    int ret =
+        LoRa.endPacket();
+
+    digitalWrite(
+        LED_PIN,
+        LOW
+    );
+
+    if (ret == 0)
+    {
+        Serial.println(
+            F("TX FAIL")
+        );
+
+        return false;
+    }
+
+    Serial.println(
+        F("TX DONE -> WAIT ACK")
+    );
+
+    sendTick = millis();
+
+    retryCnt = 0;
+
+    workState =
+        ST_WAIT_ACK;
+
+    return true;
+}
+
+// ============================================================
+// 开始新Round
+// ============================================================
+void startNewRound()
+{
+    roundId++;
+
+    pointCnt = 0;
+
+    pkgIdx = 0;
+
+    fragPointCnt = 0;
+
+    retryCnt = 0;
+
+    roundWaitTick = 0;
+
+    readEnvironment();
+
+    workState =
+        ST_SWEEPING;
+
+    Serial.print(
+        F("\n=== START ROUND ")
+    );
+
+    Serial.print(
+        roundId
+    );
+
+    Serial.println(
+        F(" ===")
+    );
+}
+
+// ============================================================
+// ACK处理
+// ============================================================
+void checkAck()
+{
+    int len =
+        LoRa.parsePacket();
+
+    if (len <= 0)
+        return;
+
+    // ACK固定4字节
+    if (len != sizeof(AckFrame))
+    {
+        while (LoRa.available())
+            LoRa.read();
+
+        Serial.println(
+            F("RX UNKNOWN")
+        );
+
+        return;
+    }
+
+    AckFrame ack;
+
+    LoRa.readBytes(
+        (uint8_t*)&ack,
+        sizeof(ack)
+    );
+
+    if (ack.magic != 0xAA)
+        return;
+
+    // --------------------------------------------------------
+    // 单包ACK
+    // --------------------------------------------------------
+    if (
+        ack.ackFlag ==
+        ACK_PKT_OK
+    )
+    {
+        if (
+            workState ==
+            ST_WAIT_ACK &&
+            ack.roundId ==
+            roundId &&
+            ack.pkgIdx ==
+            pkgIdx
+        )
+        {
+            Serial.print(
+                F("ACK OK ")
+            );
+
+            Serial.println(
+                pkgIdx + 1
+            );
+
+            // 当前包成功
+            if (
+                pkgIdx <
+                TOTAL_PACKETS - 1
+            )
+            {
+                pkgIdx++;
+
+                fragPointCnt = 0;
+
+                workState =
+                    ST_SWEEPING;
+            }
+            else
+            {
+                // 最后一包已经确认
+                // 但还不能开新Round
+                workState =
+                    ST_WAIT_ROUND_DONE;
+
+                roundWaitTick =
+                    millis();
+
+                Serial.println(
+                    F("LAST ACK -> WAIT ROUND DONE")
+                );
+            }
+        }
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // 整轮完成ACK
+    // --------------------------------------------------------
+    if (
+        ack.ackFlag ==
+        ACK_ROUND_DONE
+    )
+    {
+        if (
+            workState ==
+            ST_WAIT_ROUND_DONE &&
+            ack.roundId ==
+            roundId &&
+            ack.pkgIdx ==
+            0xFF
+        )
+        {
+            Serial.print(
+                F("ROUND DONE R=")
+            );
+
+            Serial.println(
+                roundId
+            );
+
+            startNewRound();
+        }
+    }
+}
+
+// ============================================================
+// ACK超时
+// ============================================================
+void handleAckTimeout()
+{
+    if (
+        workState !=
+        ST_WAIT_ACK
+    )
+    {
+        return;
+    }
+
+    unsigned long now =
+        millis();
+
+    if (
+        now - sendTick <
+        ACK_TIMEOUT
+    )
+    {
+        return;
+    }
+
+    retryCnt++;
+
+    Serial.print(
+        F("ACK TIMEOUT retry=")
+    );
+
+    Serial.println(
+        retryCnt
+    );
+
+    if (
+        retryCnt > MAX_RETRY
+    )
+    {
+        // 不跳下一包
+        // 继续重试当前包
+        retryCnt = 0;
+    }
+
+    sendFragment(
+        pkgIdx,
+        fragPointCnt
+    );
+}
+
+// ============================================================
+// 整轮ACK超时
+// ============================================================
+void handleRoundDoneTimeout()
+{
+    if (
+        workState !=
+        ST_WAIT_ROUND_DONE
+    )
+    {
+        return;
+    }
+
+    unsigned long now =
+        millis();
+
+    if (
+        now - roundWaitTick <
+        ROUND_WAIT_TIMEOUT
+    )
+    {
+        return;
+    }
+
+    Serial.println(
+        F("ROUND DONE TIMEOUT")
+    );
+
+    Serial.println(
+        F("RE-SEND LAST PACK")
+    );
+
+    retryCnt = 0;
+
+    // 重发最后一个分片
+    sendFragment(
+        pkgIdx,
+        fragPointCnt
+    );
+}
+
+// ============================================================
+// setup
+// ============================================================
+void setup()
+{
+    Serial.begin(9600);
+
+    delay(200);
+
+    pinMode(
+        LED_PIN,
+        OUTPUT
+    );
+
+    digitalWrite(
+        LED_PIN,
+        LOW
+    );
+
+    pinMode(
+        SOIL_PIN,
+        INPUT
+    );
+
+    pinMode(
+        MQ137_PIN,
+        INPUT
+    );
+
+    pinMode(
+        MQ136_PIN,
+        INPUT
+    );
+
+    pinMode(
+        PH_PIN,
+        INPUT
+    );
+
+    pinMode(
+        GP30_CO2_PIN,
+        INPUT
+    );
+
+    // --------------------------------------------------------
+    // I2C
+    // --------------------------------------------------------
+    Wire.begin();
+
+    if (
+        !sht31.begin(0x44)
+    )
+    {
+        Serial.println(
+            F("SHT31 ERROR")
+        );
+
+        while (1)
+        {
+            delay(100);
+        }
+    }
+
+    // --------------------------------------------------------
+    // LoRa Reset
+    // --------------------------------------------------------
+    pinMode(
+        RST_PIN,
+        OUTPUT
+    );
+
+    digitalWrite(
+        RST_PIN,
+        LOW
+    );
+
+    delay(10);
+
+    digitalWrite(
+        RST_PIN,
+        HIGH
+    );
+
+    delay(20);
+
+    // --------------------------------------------------------
+    // LoRa
+    // --------------------------------------------------------
+    LoRa.setPins(
+        SS_PIN,
+        RST_PIN,
+        DIO0_PIN
+    );
+
+    if (
+        !LoRa.begin(
+            FREQ
+        )
+    )
+    {
+        Serial.println(
+            F("LORA ERROR")
+        );
+
+        while (1)
+        {
+        }
+    }
+
+    LoRa.setSpreadingFactor(
+        SF
+    );
+
+    LoRa.setSignalBandwidth(
+        BW
+    );
+
+    LoRa.setCodingRate4(
+        CR
+    );
+
+    LoRa.setPreambleLength(
+        PREAMBLE
+    );
+
+    LoRa.enableCrc();
+
+    LoRa.disableInvertIQ();
+
+    // --------------------------------------------------------
+    // 信息
+    // --------------------------------------------------------
+    Serial.println();
+
+    Serial.println(
+        F("UNO LORA NODE")
+    );
+
+    Serial.print(
+        F("SensorHead=")
+    );
+
+    Serial.println(
+        sizeof(SensorHead)
+    );
+
+    Serial.print(
+        F("PointBin=")
+    );
+
+    Serial.println(
+        sizeof(PointBin)
+    );
+
+    Serial.print(
+        F("FragRAM=")
+    );
+
+    Serial.println(
+        sizeof(fragBuf)
+    );
+
+    // --------------------------------------------------------
+    // 第一轮
+    // --------------------------------------------------------
+    startNewRound();
+}
+
+// ============================================================
+// loop
+// ============================================================
+void loop()
+{
+    unsigned long now =
+        millis();
+
+    // --------------------------------------------------------
+    // pH持续采样
+    // --------------------------------------------------------
+    if (
+        now - lastPHTime >= 20
+    )
+    {
+        pHArray[pHIndex] =
+            analogRead(PH_PIN);
+
+        pHIndex++;
+
+        if (
+            pHIndex >=
+            PH_ARRAY_LEN
+        )
+        {
+            pHIndex = 0;
+        }
+
+        lastPHTime = now;
+    }
+
+    // --------------------------------------------------------
+    // 优先处理ACK
+    // --------------------------------------------------------
+    checkAck();
+
+    // --------------------------------------------------------
+    // ACK超时
+    // --------------------------------------------------------
+    handleAckTimeout();
+
+    // --------------------------------------------------------
+    // ROUND_DONE超时
+    // --------------------------------------------------------
+    handleRoundDoneTimeout();
+
+    // --------------------------------------------------------
+    // 只有ST_SWEEPING才能采样
+    // --------------------------------------------------------
+    if (
+        workState !=
+        ST_SWEEPING
+    )
+    {
+        return;
+    }
+
+    // --------------------------------------------------------
+    // 防止超过100点
+    // --------------------------------------------------------
+    if (
+        pointCnt >=
+        SWEEP_POINTS
+    )
+    {
+        return;
+    }
+
+    // --------------------------------------------------------
+    // 模拟阻抗
+    // 后续换成真实AD5933
+    // --------------------------------------------------------
+    uint32_t freq =
+        START_FREQ_HZ
+        +
+        (uint32_t)pointCnt *
+        FREQ_STEP_HZ;
+
+    int16_t re =
+        (int16_t)(
+            2800
+            -
+            pointCnt * 12
+            +
+            sin(
+                pointCnt * 0.15f
+            ) * 400.0f
+        );
+
+    int16_t im =
+        (int16_t)(
+            -120
+            +
+            cos(
+                pointCnt * 0.2f
+            ) * 80.0f
+        );
+
+    float mag =
+        sqrt(
+            (float)re * re
+            +
+            (float)im * im
+        );
+
+    float z =
+        (
+            mag > 1.0f &&
+            calGain > 1e-9f
+        )
+        ?
+        1.0f / (mag * calGain)
+        :
+        -1.0f;
+
+    // --------------------------------------------------------
+    // 存入当前分片
+    // --------------------------------------------------------
+    fragBuf[
+        fragPointCnt
+    ].f = freq;
+
+    fragBuf[
+        fragPointCnt
+    ].re = re;
+
+    fragBuf[
+        fragPointCnt
+    ].im = im;
+
+    fragBuf[
+        fragPointCnt
+    ].Z_x100 =
+        (int32_t)(
+            z * 100.0f
+        );
+
+    fragPointCnt++;
+
+    pointCnt++;
+
+    // --------------------------------------------------------
+    // 调试
+    // --------------------------------------------------------
+    Serial.print(
+        F("P")
+    );
+
+    Serial.print(
+        pointCnt
+    );
+
+    Serial.print(
+        F(" ")
+    );
+
+    Serial.println(
+        z,
+        1
+    );
+
+    // --------------------------------------------------------
+    // 10点满包
+    // --------------------------------------------------------
+    if (
+        fragPointCnt >=
+        POINT_PER_PACK
+    )
+    {
+        sendFragment(
+            pkgIdx,
+            fragPointCnt
+        );
+    }
+}

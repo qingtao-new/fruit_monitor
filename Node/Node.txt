@@ -1,0 +1,562 @@
+// =====================================================================
+// 果实监测节点：环境传感器 + 阻抗谱扫频
+//
+// 阻抗测量原理（同步检测法）：
+//   激励方波经耦合电路驱动"参考电阻 R_REF + 样品"串联支路，
+//   同时用 ADC 采两路：Z_IN（样品两端电压）、Z_REF（激励参考）。
+//   采样率远高于最高激励频率，按硬实时时间戳算出每个采样点相对
+//   激励周期的相位，做一次 DFT 取基波：
+//       I  = Σ v·cos(2πφ)      Q  = Σ v·sin(2πφ)
+//   参考支路做同样的投影得 I_r / Q_r，再由串联通路关系反解
+//       Z_sample = R_REF · (I + jQ) / (I_r + jQ_r)
+//   这样不用知道激励幅值与相位偏移，硬件失调和幅值漂移都被除掉。
+//
+// LoRa 上行：按 SEG_POINTS 点为一组，逐点发一条 JSON 帧，
+// 每组末尾附 seg 完成标记；网关负责聚合成整轮再走 MQTT。
+// =====================================================================
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_SHT31.h>
+#include <string.h>
+#include <esp_timer.h>
+
+#define SS 10
+#define RST 9
+#define DIO0 8
+#define FREQ 433E6
+#define SF 7
+#define BW 250E3
+#define CR 5
+#define PREAMBLE 12
+#define LED 6
+
+#define SOIL_PIN A0
+#define MQ137_PIN A1
+#define MQ136_PIN A2
+#define PH_PIN A3
+#define GP30_CO2_PIN A6
+
+#define SOIL_DRY 1023
+#define SOIL_WET 300
+#define MQ137_CLEAN_AIR 200
+#define MQ136_CLEAN_AIR 150
+#define PH_Offset 21.677
+#define PH_ArrayLenth 40
+
+#define GP30_ZERO_ADC 120
+#define GP30_FULL_ADC 920
+#define CO2_FULL_PPM 5000
+
+#define NODE_ID "LORA_NODE_01"
+
+// ============ 阻抗测量引脚（按实际电路改）============
+#define Z_EXC_PIN 4      // 激励输出：PWM → 限幅/耦合电容 → 电极 +
+#define Z_IN_CH   0      // ADC1_CH0：样品两端电压（经跟随/分压到 0~3.3V）
+#define Z_REF_CH  1      // ADC1_CH1：激励参考（激励经分压后采样）
+#define R_REF_OHM 1000.0 // 参考电阻（Ω），与样品串联
+#define Z_MID_LEVEL 2048 // 静态偏置电平（≈1.65V），投影前减去
+#define Z_IM_SIGN (-1.0f) // 电容性样品 Z'' 为负；接线极性相反时改成 +1
+
+// ============ 扫频参数 ============
+#define FREQ_MIN_HZ 1000.0    // 请求下限
+#define FREQ_MAX_HZ 100000.0  // 请求上限（实际受 FREQ_MAX_MEAS_HZ 限制）
+#define TOTAL_POINTS 100      // 每轮频点数
+#define SEG_POINTS 50         // 每组点数（与网关 SEG_POINTS 必须一致）
+#define SEGMENTS (TOTAL_POINTS / SEG_POINTS)
+
+#define SAMPLE_RATE_HZ 100000L    // 采样率
+#define SAMPLES_PER_POINT 4000L   // 每频点采样数
+#define MIN_CYCLES_PER_POINT 4    // 每个频点至少采满的激励周期数
+#define SAMPLES_PER_CYCLE_MIN 8   // 每个激励周期至少的采样数（DFT 质量下限）
+
+// 可测上限由采样率和每周期采样数共同决定。
+// 想扫到更高频，得先上更快的 ADC 路径（ESP32 经典版用 ADC DMA 可到 1 MSPS），
+// 不能只改这里的宏。
+#define FREQ_MAX_MEAS_HZ (SAMPLE_RATE_HZ / SAMPLES_PER_CYCLE_MIN)
+
+#define CMD_START 0x11
+#define CMD_NEXT 0x14
+#define CMD_RETRY_MASK 0x13
+
+#define EXC_LED_CHANNEL 0
+#define EXC_RESOLUTION 8          // 8-bit 占空比，128 = 50%
+#define EXC_DUTY 128
+
+// ---- ADC 接口：经典 ESP32 与 ESP32-S3 的 API 名不一样 ----
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3) \
+    || defined(CONFIG_IDF_TARGET_ESP32C6)
+#include <esp_adc/adc_oneshot.h>
+static esp_err_t adcInit(void) { return ESP_OK; }
+static int adcReadRaw(int ch) {
+  int raw = 0;
+  (void)adc_oneshot_read(&adc1_oneshot_unit, (adc_channel_t)ch, &raw);
+  return raw;
+}
+#else
+static esp_err_t adcInit(void) {
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_set_attenuation(ADC_ATTEN_DB_11);
+  return ESP_OK;
+}
+static int adcReadRaw(int ch) { return adc1_get_raw((adc1_channel_t)ch); }
+#endif
+
+Adafruit_SHT31 sht31;
+
+int pHArray[PH_ArrayLenth];
+int pHArrayIndex = 0;
+unsigned long lastPHTime = 0;
+unsigned long sendTimer = 0;
+const unsigned long sendInterval = 2000;
+
+// ---- 扫频状态 ----
+uint8_t currentRound = 0;
+uint8_t currentSeg = 0;
+bool pointDone[TOTAL_POINTS] = {false};
+bool sweepArmed = false;
+unsigned long lastCmdTime = 0;
+
+// ---- 采样任务状态（ISR 访问，均用 volatile）----
+static volatile int32_t sampleCount = 0;
+static volatile int32_t targetSamples = 0;
+static volatile uint32_t phaseU = 0;      // 相位累加器，定点 0..2^32-1
+static volatile uint32_t phaseStep = 0;   // 每采样步进
+static volatile float accI = 0, accQ = 0, accIr = 0, accQr = 0;
+static volatile bool sampling = false;
+static esp_timer_handle_t sampleTimer = nullptr;
+
+#define LUT_SIZE 256
+// 256 点正弦/余弦表，int16（幅值 32767）
+static const int16_t SIN_LUT[LUT_SIZE] = {
+  0, 404, 808, 1212, 1616, 2019, 2421, 2822, 3222, 3620, 4017, 4412,
+  4805, 5196, 5583, 5968, 6350, 6729, 7104, 7476, 7844, 8208, 8568, 8924,
+  9276, 9623, 9965, 10303, 10636, 10964, 11287, 11604, 11916, 12222,
+  12522, 12816, 13103, 13383, 13657, 13923, 14182, 14433, 14677, 14912,
+  15140, 15359, 15569, 15771, 15964, 16148, 16323, 16488, 16644, 16790,
+  16926, 17052, 17168, 17273, 17367, 17451, 17524, 17586, 17637, 17676,
+  17704, 17720, 17724, 17716, 17696, 17664, 17619, 17562, 17493, 17411,
+  17316, 17209, 17089, 16956, 16811, 16653, 16482, 16299, 16103, 15894,
+  15672, 15437, 15189, 14928, 14655, 14368, 14069, 13758, 13434, 13098,
+  12750, 12389, 12017, 11632, 11235, 10826, 10405, 9973, 9528, 9072,
+  8605, 8126, 7636, 7135, 6623, 6101, 5567, 5024, 4469, 3905, 3331, 2746,
+  2152, 1549, 935, 312, -320, -959, -1596, -2231, -2863, -3493,
+  -4120, -4743, -5362, -5977, -6587, -7192, -7792, -8386, -8974, -9555,
+  -10130, -10697, -11256, -11808, -12350, -12884, -13408, -13923, -14427, -14921,
+  -15403, -15874, -16332, -16778, -17211, -17631, -18038, -18431, -18810, -19174,
+  -19524, -19859, -20179, -20483, -20772, -21045, -21298, -21529, -21739, -21926,
+  -22091, -22232, -22350, -22443, -22513, -22558, -22580, -22577, -22550, -22499,
+  -22423, -22323, -22198, -22048, -21873, -21673, -21448, -21198, -20924, -20625,
+  -20302, -19955, -19584, -19190, -18772, -18331, -17867, -17381, -16872, -16341,
+  -15789, -15214, -14618, -14002, -13364, -12706, -12029, -11331, -10614, -9877,
+  -9122, -8348, -7555, -6745, -5918, -5073, -4212, -3335, -2442, -1534,
+  -611, 266, 1152, 2037, 2920, 3799, 4674, 5542, 6402, 7254,
+  8096, 8926, 9743, 10546, 11334, 12105, 12859, 13594, 14309, 15004,
+  15677, 16327, 16952, 17552, 18125, 18669, 19184, 19667, 20118, 20536,
+  20919, 21267, 21579, 21853, 22089, 22287, 22446, 22564, 22643, 22681
+};
+
+#define COS_LUT(i) SIN_LUT[((i) + (LUT_SIZE / 4)) & (LUT_SIZE - 1)]
+
+static const float INV_AMP = 1.0f / 32767.0f;
+
+void IRAM_ATTR sampleIrq(void *arg) {
+  if (!sampling) return;
+
+  int z = adcReadRaw(Z_IN_CH);
+  int rf = adcReadRaw(Z_REF_CH);
+
+  uint32_t ph = phaseU;
+  phaseU += phaseStep;
+  uint8_t idx = (uint8_t)(ph >> 24);
+
+  int16_t c = COS_LUT(idx);
+  int16_t s = SIN_LUT[idx];
+  float cf = c * INV_AMP;
+  float sf = s * INV_AMP;
+
+  accI += (float)(z - Z_MID_LEVEL) * cf;
+  accQ += (float)(z - Z_MID_LEVEL) * sf;
+  accIr += (float)(rf - Z_MID_LEVEL) * cf;
+  accQr += (float)(rf - Z_MID_LEVEL) * sf;
+
+  if (++sampleCount >= targetSamples) {
+    sampling = false;
+    if (sampleTimer) esp_timer_stop(sampleTimer);
+  }
+}
+
+// 计算指定频点的复阻抗
+bool measureImpedance(float freqHz, int32_t samples, float &re, float &im, float &mag) {
+  // LEDC 激励
+  if (freqHz < 1.0f) freqHz = 1.0f;
+  ledcSetup(EXC_LED_CHANNEL, freqHz, EXC_RESOLUTION);
+  ledcAttachPin(Z_EXC_PIN, EXC_LED_CHANNEL);
+  ledcWrite(EXC_LED_CHANNEL, EXC_DUTY);
+
+  if (!sampleTimer) {
+    const esp_timer_create_args_t args = {
+      .callback = sampleIrq,
+      .name = "z_sample",
+    };
+    if (esp_timer_create(&args, &sampleTimer) != ESP_OK) return false;
+  }
+
+  // 保证至少 MIN_CYCLES_PER_POINT 个周期
+  int32_t minSamples = (int32_t)(MIN_CYCLES_PER_POINT * freqHz);
+  if (minSamples > samples) samples = minSamples;
+  if (samples > SAMPLES_PER_POINT) samples = SAMPLES_PER_POINT;
+
+  uint32_t stepU = (uint32_t)(((double)freqHz * 4294967296.0) / (double)SAMPLE_RATE_HZ);
+  if (stepU == 0) stepU = 1;
+
+  sampleCount = 0;
+  targetSamples = samples;
+  phaseU = 0;
+  accI = accQ = accIr = accQr = 0;
+  sampling = true;
+
+  const esp_timer_period_t period = 1000000LL / SAMPLE_RATE_HZ;
+  if (esp_timer_start_periodic(sampleTimer, period) != ESP_OK) {
+    sampling = false;
+    return false;
+  }
+
+  // 等采样完成（最多等 100ms，正常远小于此）
+  uint32_t t0 = millis();
+  while (sampling && (millis() - t0) < 100) {
+    delay(1);
+  }
+  if (sampling) {
+    sampling = false;
+    esp_timer_stop(sampleTimer);
+  }
+
+  float n = (float)sampleCount;
+  if (n < 4.0f) return false;
+  accI /= n; accQ /= n; accIr /= n; accQr /= n;
+
+  // 参考支路幅值太小（激励没通到）时不可解
+  float denom = accIr * accIr + accQr * accQr;
+  if (denom < 1e-6f) return false;
+
+  float zr = R_REF_OHM * (accI * accIr + accQ * accQr) / denom;
+  float zi = R_REF_OHM * (accQ * accIr - accI * accQr) / denom * Z_IM_SIGN;
+  re = zr;
+  im = zi;
+  mag = sqrtf(zr * zr + zi * zi);
+  return true;
+}
+
+float sweepFrequency(int index) {
+  // 对数分布在 [FREQ_MIN_HZ, min(FREQ_MAX_HZ, FREQ_MAX_MEAS_HZ)]
+  if (TOTAL_POINTS <= 1) return FREQ_MIN_HZ;
+  float hi = FREQ_MAX_HZ;
+  if (hi > FREQ_MAX_MEAS_HZ) hi = FREQ_MAX_MEAS_HZ;
+  double ratio = (double)hi / (double)FREQ_MIN_HZ;
+  double step = log(ratio) / (double)(TOTAL_POINTS - 1);
+  return (float)(FREQ_MIN_HZ * exp((double)index * step));
+}
+
+// ---- 环境传感器 ----
+
+double avergearray(int* arr, int num) {
+  int i, max, min;
+  long sum = 0;
+
+  if (num < 5) {
+    for (i = 0; i < num; i++) sum += arr[i];
+    return (double)sum / num;
+  }
+
+  min = arr[0];
+  max = arr[1];
+  for (i = 2; i < num; i++) {
+    if (arr[i] < min) {
+      sum += min;
+      min = arr[i];
+    } else if (arr[i] > max) {
+      sum += max;
+      max = arr[i];
+    } else {
+      sum += arr[i];
+    }
+  }
+
+  return (double)sum / (num - 2);
+}
+
+int readGP30_CO2() {
+  int adcVal = analogRead(GP30_CO2_PIN);
+  int co2ppm = map(adcVal, GP30_ZERO_ADC, GP30_FULL_ADC, 0, CO2_FULL_PPM);
+  co2ppm = constrain(co2ppm, 0, CO2_FULL_PPM);
+  return co2ppm;
+}
+
+float readSoil() {
+  int raw = analogRead(SOIL_PIN);
+  return (float)constrain(map(raw, SOIL_DRY, SOIL_WET, 0, 100), 0, 100);
+}
+
+float readNH3() {
+  int raw = analogRead(MQ137_PIN);
+  return (float)constrain(map(raw, MQ137_CLEAN_AIR, 1023, 0, 100), 0, 100);
+}
+
+float readH2S() {
+  int raw = analogRead(MQ136_PIN);
+  return (float)constrain(map(raw, MQ136_CLEAN_AIR, 1023, 0, 50), 0, 50);
+}
+
+// ---- LoRa ----
+
+void loraSendFrame(const String &msg) {
+  digitalWrite(LED, HIGH);
+  LoRa.beginPacket();
+  LoRa.print(msg);
+  LoRa.print('\n');
+  LoRa.endPacket();
+  digitalWrite(LED, LOW);
+}
+
+void loraRecv() {
+  int pktLen = LoRa.parsePacket();
+  if (pktLen <= 0) return;
+
+  if (pktLen == 1) {
+    uint8_t cmd = (uint8_t)LoRa.read();
+    if (cmd == CMD_START) {
+      currentSeg = 0;
+      sweepArmed = true;
+      lastCmdTime = millis();
+      memset(pointDone, 0, sizeof(pointDone));
+      Serial.println("📥网关命令: START → 第1段");
+    } else if (cmd == CMD_NEXT) {
+      if (currentSeg + 1 < SEGMENTS) currentSeg++;
+      sweepArmed = true;
+      lastCmdTime = millis();
+      Serial.print("📥网关命令: NEXT → 第");
+      Serial.print(currentSeg + 1);
+      Serial.println("段");
+    } else if (cmd == CMD_RETRY_MASK) {
+      // 后面最多 7 字节 = 56 bit 掩码，标记本段内需要重发的点
+      unsigned long t0 = millis();
+      int byteIdx = 0;
+      while (LoRa.available() && byteIdx < 7 && (millis() - t0) < 200) {
+        uint8_t b = (uint8_t)LoRa.read();
+        for (int k = 0; k < 8; k++) {
+          if (b & (1 << k)) {
+            int gi = currentSeg * SEG_POINTS + byteIdx * 8 + k;
+            if (gi < TOTAL_POINTS) pointDone[gi] = false;
+          }
+        }
+        byteIdx++;
+      }
+      sweepArmed = true;
+      lastCmdTime = millis();
+      Serial.println("📥网关命令: RETRY → 补发缺点");
+    }
+    return;
+  }
+
+  if (pktLen > 240) return;
+  char buf[256] = {0};
+  int idx = 0;
+  while (LoRa.available() && idx < 255) {
+    buf[idx++] = LoRa.read();
+  }
+  // 兼容网关偶尔以 JSON 形式下发的命令
+  if (strstr(buf, "\"cmd\":\"start\"")) {
+    currentSeg = 0; sweepArmed = true; lastCmdTime = millis();
+  } else if (strstr(buf, "\"cmd\":\"next\"")) {
+    if (currentSeg + 1 < SEGMENTS) currentSeg++;
+    sweepArmed = true; lastCmdTime = millis();
+  }
+}
+
+void sendPoint(int gi, float zRe, float zIm, float zMag, const char *envJson) {
+  char payload[220];
+  snprintf(payload, sizeof(payload),
+           "{\"round\":%u,\"seg\":%u,\"pt\":%u,\"freq\":%lu,\"re\":%.0f,\"im\":%.0f,\"imp\":%lu,%s}",
+           (unsigned)currentRound,
+           (unsigned)currentSeg,
+           (unsigned)(gi - currentSeg * SEG_POINTS),
+           (unsigned long)lround(sweepFrequency(gi)),
+           zRe, zIm, (unsigned long)lround(zMag),
+           envJson);
+  loraSendFrame(payload);
+  delay(25);   // 433MHz/SF7 帧间隔，避免空中碰撞
+}
+
+// 执行当前段的全部频点采集与上报
+void runSegment(const char *envJson) {
+  int base = currentSeg * SEG_POINTS;
+  Serial.print("⚙️开始采集第");
+  Serial.print(currentSeg + 1);
+  Serial.println("段");
+
+  for (int k = 0; k < SEG_POINTS; k++) {
+    int gi = base + k;
+    if (pointDone[gi]) continue;
+
+    float zRe, zIm, zMag;
+    if (!measureImpedance(sweepFrequency(gi), SAMPLES_PER_POINT, zRe, zIm, zMag)) {
+      Serial.print("⚠️测量失败 pt=");
+      Serial.println(gi);
+      zRe = 0; zIm = 0; zMag = 0;
+    }
+    sendPoint(gi, zRe, zIm, zMag, envJson);
+    pointDone[gi] = true;
+
+    Serial.print("📤R");
+    Serial.print(currentRound);
+    Serial.print(" seg=");
+    Serial.print(currentSeg);
+    Serial.print(" pt=");
+    Serial.print(gi);
+    Serial.print("/100 ");
+    Serial.print(sweepFrequency(gi));
+    Serial.print("Hz re=");
+    Serial.print(zRe, 0);
+    Serial.print(" im=");
+    Serial.print(zIm, 0);
+    Serial.print(" |Z|=");
+    Serial.println(zMag, 0);
+  }
+
+  // 段完成通知（网关据此切段）
+  char doneMsg[96];
+  snprintf(doneMsg, sizeof(doneMsg),
+           "{\"round\":%u,\"seg\":%u,\"done\":true,\"points\":%u,\"ts\":%lu}",
+           (unsigned)currentRound, (unsigned)currentSeg,
+           (unsigned)SEG_POINTS, (unsigned long)(millis() / 1000UL));
+  loraSendFrame(doneMsg);
+
+  Serial.print("✅第");
+  Serial.print(currentSeg + 1);
+  Serial.print("段完成。剩余未发点:");
+  int pending = 0;
+  for (int i = base; i < base + SEG_POINTS && i < TOTAL_POINTS; i++) pending += !pointDone[i];
+  Serial.println(pending);
+}
+
+float soilPct = 0, tempC = 25, nh3Pct = 0, h2sPct = 0, phVal = 7, humPct = 45;
+int co2Val = 400;
+
+void maybeRunSweep() {
+  if (!sweepArmed) return;
+
+  // 新一轮：每次 START 使轮次 +1
+  static uint8_t lastStartRound = 0;
+  if (currentRound != lastStartRound) {
+    currentRound = currentRound + 1;
+    lastStartRound = currentRound;
+  }
+
+  char env[160];
+  snprintf(env, sizeof(env),
+           "\"soil_moisture\":%.0f,\"temperature\":%.2f,\"nh3\":%.0f,\"h2s\":%.0f,\"co2\":%d,\"ph\":%.2f,\"humidity\":%d",
+           soilPct, tempC, nh3Pct, h2sPct, co2Val, phVal, humPct);
+
+  runSegment(env);
+  sweepArmed = false;
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED, OUTPUT);
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(MQ137_PIN, INPUT);
+  pinMode(MQ136_PIN, INPUT);
+  pinMode(PH_PIN, INPUT);
+  pinMode(GP30_CO2_PIN, INPUT);
+
+  analogReadResolution(12);
+  if (adcInit() != ESP_OK) {
+    Serial.println("⚠️ ADC 初始化失败，阻抗测量将不可用");
+  }
+  pinMode(Z_EXC_PIN, OUTPUT);
+  digitalWrite(Z_EXC_PIN, LOW);
+
+  Wire.begin();
+  if (!sht31.begin(0x44)) {
+    Serial.println("❌ SHT31 初始化失败");
+    while (1) delay(100);
+  }
+
+  pinMode(RST, OUTPUT);
+  digitalWrite(RST, LOW);
+  delay(10);
+  digitalWrite(RST, HIGH);
+  delay(20);
+
+  LoRa.setPins(SS, RST, DIO0);
+  if (!LoRa.begin(FREQ)) {
+    Serial.println("❌ LoRa 初始化失败");
+    while (1);
+  }
+
+  LoRa.setSpreadingFactor(SF);
+  LoRa.setSignalBandwidth(BW);
+  LoRa.setCodingRate4(CR);
+  LoRa.setPreambleLength(PREAMBLE);
+  LoRa.enableCrc();
+  LoRa.disableInvertIQ();
+
+  LoRa.receive();
+
+  Serial.println("==== 果实监测节点：环境 + 阻抗谱 ====");
+  Serial.print("扫频 ");
+  Serial.print(FREQ_MIN_HZ);
+  Serial.print(" → ");
+  Serial.print(FREQ_MAX_HZ);
+  Serial.print(" Hz（可测上限 ");
+  Serial.print(FREQ_MAX_MEAS_HZ);
+  Serial.print(" Hz，受采样率限制）");
+  Serial.print(TOTAL_POINTS);
+  Serial.print(" 点 / 轮，");
+  Serial.print(SEGMENTS);
+  Serial.println(" 组");
+}
+
+void loop() {
+  // pH 连续采样缓冲（每 20ms 一点，取滑动中位均值）
+  if (millis() - lastPHTime > 20) {
+    pHArray[pHArrayIndex++] = analogRead(PH_PIN);
+    if (pHArrayIndex >= PH_ArrayLenth) pHArrayIndex = 0;
+    lastPHTime = millis();
+  }
+
+  // 环境量刷新（与阻抗采集共用，频率不高）
+  soilPct = readSoil();
+  nh3Pct = readNH3();
+  h2sPct = readH2S();
+  co2Val = readGP30_CO2();
+
+  float shtTemp = sht31.readTemperature();
+  float shtHum = sht31.readHumidity();
+  if (!isnan(shtTemp) && !isnan(shtHum)) {
+    tempC = shtTemp;
+    humPct = (int)shtHum;
+  }
+
+  double vol = avergearray(pHArray, PH_ArrayLenth) * 5.0 / 1024.0;
+  phVal = constrain(-5.8887 * vol + PH_Offset, 0.0, 14.0);
+
+  // 纯环境帧：无 round 字段，网关按心跳处理
+  if (millis() - sendTimer > sendInterval) {
+    sendTimer = millis();
+    char envOnly[160];
+    snprintf(envOnly, sizeof(envOnly),
+             "{\"id\":\"%s\",\"soil_moisture\":%.0f,\"temperature\":%.2f,\"nh3\":%.0f,"
+             "\"h2s\":%.0f,\"co2\":%d,\"ph\":%.2f,\"humidity\":%d}",
+             NODE_ID, soilPct, tempC, nh3Pct, h2sPct, co2Val, phVal, humPct);
+    loraSendFrame(envOnly);
+    Serial.println("📤环境帧已发");
+  }
+
+  loraRecv();
+  maybeRunSweep();
+  delay(50);
+}

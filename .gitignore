@@ -17,14 +17,14 @@ ENV/
 # ===== 运行时配置（含本地密钥/端口，不入库）=====
 config/config.json
 
-# ===== 数据库与数据 =====
-data/*.db
-data/*.sqlite
-data/*.sqlite3
+# ===== 数据库与数据（全为运行时产物：库、备份、ML 模型、迁移数据集）=====
+data/
 
 # ===== 日志 =====
 logs/
 *.log
+*.err
+*.out
 
 # ===== 分析输出 / 临时结果 =====
 *.json
@@ -44,3 +44,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# ===== 一次性诊断脚本（下划线前缀）=====
+_*.py
+!__init__.py

@@ -32,19 +32,15 @@ cd E:\opencode\fruit_monitor
 ## 4. 观察界面效果
 
 界面中会看到：
-- 实时曲线更新
-- 传感器数值卡片刷新
-- 模拟设备状态显示
-- 录制开关、历史查询、导出等入口
 
-如果你想验证“常规模拟数据 + 错误矫正”是否生效：
-- 直接运行 `main.py --simulator`
-- 观察曲线是否平滑、是否还有明显坏点
-- 如有需要，再看数据库里的落库结果
+- 传感器数值卡片，带红涨绿跌趋势箭头和环比差值
+- 多指标实时曲线（趋势叠加，最近 1 段滚动）
+- 设备状态呼吸灯：在线 / 重连 / 离线
+- `阻抗谱 EIS` 页签：Nyquist 圆弧（含弛豫频率 `f_c` 标注）+ Bode 双轴
+- 成熟度面板：置信度仪表、四阶段步骤条、预计采摘日期
+- 录制开关、轮次选择、历史查询、导出等入口
 
-## 5. 运行分析模块
-
-如果你只想快速看分析结果，可以先运行分析脚本：
+如果你只想看分析结果，可以直接跑分析脚本：
 
 ```powershell
 .\.venv\Scripts\python.exe analysis.py --gateway GW_001 --node LORA_NODE_01 --model centroid
@@ -138,3 +134,21 @@ cd E:\opencode\fruit_monitor
 ```
 
 如果界面能打开，就说明当前版本已经可以正常使用。
+
+## 10. 运行测试
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+```
+
+覆盖分帧、扫频分包解析与拼装、Nyquist / Bode 序列、弛豫频率、
+成熟度标定与置信度、SQLite 建表与并发写入。
+
+## 11. 接真实硬件
+
+节点和网关固件在 `Node/Node.ino` 与 `Gateway/Gateway.ino`，
+扫频原理、接线、LoRa 命令和标定流程见 `docs/eis_pipeline.md`。
+
+`config/config.json` 里 `maturity` 段控制成熟度标定的两端 |Z| 值和
+有效频段；`assembler` 段控制扫频分包的超时时间和并发扫描数上限。
+改配置不用重新编译。

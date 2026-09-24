@@ -1,0 +1,624 @@
+// =====================================================================
+// ESP32-S3 网关：LoRa 节点聚合 + 阻抗谱整轮上报 + 本地 MQTT
+//
+// 数据流：
+//   节点 --LoRa--> 网关(聚合 100 点/轮) --MQTT--> PC
+//
+// 上行 MQTT 帧统一以 \n 结尾（PC 侧 protocol.LineFramer 分帧）：
+//   fruit/<GW>/<NODE>/sweep     分段扫频帧（freq/re/im/imp 并行数组）
+//   fruit/<GW>/<NODE>/sensor    环境帧（节点每 2s 一帧，网关透传）
+//   fruit/<GW>/<NODE>/status    网关心跳 / 轮次完成摘要
+// =====================================================================
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <string.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+#define VSPI_SCK    14
+#define VSPI_MOSI   13
+#define VSPI_MISO   12
+#define LORA_CS     10
+#define LORA_RST    9
+#define LORA_DIO0   -1
+#define LED_PIN     11
+
+#define LORA_FREQ     433E6
+#define LORA_SF       7
+#define LORA_BW       250E3
+#define LORA_CR       5
+#define LORA_PREAMBLE 12
+#define LORA_TX_POWER 17
+
+#define CMD_START      0x11
+#define CMD_RETRY_MASK 0x13
+#define CMD_NEXT       0x14
+#define SEG_POINTS     50
+#define TOTAL_POINTS   100
+#define SEGMENTS       (TOTAL_POINTS / SEG_POINTS)
+
+#define MAX_ROUND_RETRY 3        // 一轮内最多补发几次缺点
+#define FRAME_TAIL     "\n"      // 所有 MQTT 帧统一换行结尾
+
+// ============ 必填：改成你路由器的 WiFi 名称和密码 ============
+const char* WIFI_SSID = "YOUR_WIFI_SSID";       // ← 改成你的 WiFi 名称
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"; // ← 改成你的 WiFi 密码（不入库）
+
+// ============ 本地 MQTT（broker 在 192.168.1.104，即电脑本机）============
+const char* LOCAL_MQTT_HOST = "192.168.1.104";
+const uint16_t LOCAL_MQTT_PORT = 1883;
+const char* LOCAL_CLIENT_ID = "fruit_gateway_esp32s3";
+const char* SWEEP_TOPIC = "fruit/GW_001/LORA_NODE_01/sweep";
+const char* SENSOR_TOPIC = "fruit/GW_001/LORA_NODE_01/sensor";
+const char* STATUS_TOPIC = "fruit/GW_001/LORA_NODE_01/status";
+#define MQTT_BUFFER_SIZE 12000
+#define HEARTBEAT_INTERVAL_MS 30000
+
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+
+unsigned long lastWifiReconnect = 0;
+#define WIFI_RECONNECT_INTERVAL 5000
+bool wifiConnecting = false;
+unsigned long wifiTryStart = 0;
+
+unsigned long lastHeartbeatTime = 0;
+
+uint16_t fArr[TOTAL_POINTS];
+int16_t reArr[TOTAL_POINTS];
+int16_t imArr[TOTAL_POINTS];
+uint16_t impArr[TOTAL_POINTS];
+uint8_t soilArr[TOTAL_POINTS];
+int16_t tempX100[TOTAL_POINTS];
+uint8_t nh3Arr[TOTAL_POINTS];
+uint8_t h2sArr[TOTAL_POINTS];
+uint16_t co2Arr[TOTAL_POINTS];
+uint16_t phX100[TOTAL_POINTS];
+uint8_t humArr[TOTAL_POINTS];
+bool pointReady[TOTAL_POINTS] = {false};
+
+uint8_t currentRound = 0;
+uint8_t currentSeg = 0;
+uint8_t roundRetryCount = 0;
+unsigned long lastRxTime = 0;
+unsigned long lastReviveTime = 0;
+const unsigned long ROUND_RESTART_MS = 10000;
+unsigned long startupTime = 0;
+
+char rxBuf[300];
+
+// ---- JSON 数值解析（只取第一个命中的 key，足够用于本项目的帧）----
+float jsonField(const char *s, const char *key) {
+  char k[24];
+  snprintf(k, sizeof(k), "\"%s\":", key);
+  const char *p = strstr(s, k);
+  if (!p) return 0;
+  return atof(p + strlen(k));
+}
+
+bool jsonHasKey(const char *s, const char *key) {
+  char k[24];
+  snprintf(k, sizeof(k), "\"%s\":", key);
+  return strstr(s, k) != nullptr;
+}
+
+// ---- WiFi ----
+
+bool connectWifiOnce(int timeoutMs) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("连接WiFi: ");
+  Serial.print(WIFI_SSID);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < (unsigned long)timeoutMs) {
+    delay(200);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(" → 成功, IP=");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  Serial.println(" → 失败（检查 SSID/密码，稍后自动重试）");
+  return false;
+}
+
+void wifiMaintain() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnecting = false;
+    return;
+  }
+  if (!wifiConnecting) {
+    wifiConnecting = true;
+    wifiTryStart = millis();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.println("WiFi 掉线，重新连接...");
+  } else if (millis() - wifiTryStart > 20000) {
+    wifiConnecting = false;
+    WiFi.disconnect();
+    Serial.println("WiFi 重连超时，稍后重试");
+  }
+}
+
+// ---- MQTT ----
+
+// qos 1：MQTT 会重投，PC 侧按 (gateway, node, round, point_index) 去重，
+// 重复投递不会产生重复曲线点。
+bool publishRaw(const char *topic, const String &payload) {
+  if (!mqttClient.connected()) return false;
+  String frame = payload;
+  frame += FRAME_TAIL;
+  return mqttClient.publish(topic, frame.c_str(), frame.length(), false, 1);
+}
+
+void publishHeartbeat() {
+  if (!mqttClient.connected()) return;
+  String p = "{\"type\":\"status\",\"gateway_id\":\"GW_001\",\"node_id\":\"LORA_NODE_01\",";
+  p += "\"status\":\"heartbeat\",";
+  p += "\"timestamp\":" + String(millis() / 1000UL);
+  p += ",\"ip\":\"";
+  p += WiFi.localIP().toString();
+  p += "\",\"rssi\":";
+  p += String(WiFi.RSSI());
+  p += "}";
+  bool ok = publishRaw(STATUS_TOPIC, p);
+  Serial.print("心跳发送: ");
+  Serial.println(ok ? "OK" : "FAIL");
+}
+
+void mqttConnectLocal() {
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    return;
+  }
+  mqttClient.setServer(LOCAL_MQTT_HOST, LOCAL_MQTT_PORT);
+  Serial.print("连接本地MQTT ");
+  Serial.print(LOCAL_MQTT_HOST);
+  Serial.print(":");
+  Serial.print(LOCAL_MQTT_PORT);
+  Serial.print(" ...");
+  if (mqttClient.connect(LOCAL_CLIENT_ID)) {
+    Serial.println(" 连接成功");
+    publishHeartbeat();
+  } else {
+    int st = mqttClient.state();
+    Serial.print(" 连接失败，错误码=");
+    Serial.println(st);
+    if (st == -2) Serial.println("  → 连不上 broker：确认 broker 已启动、1883 端口开放，且网关与电脑在同一网段");
+    else if (st == -4) Serial.println("  → broker 拒绝连接：检查是否禁止匿名访问");
+    else if (st == -5) Serial.println("  → 用户名/密码错误");
+  }
+}
+
+// 节点 2s 一次的环境帧：解包后透传给 PC。
+// PC 侧 parse_sensor 期望字段在顶层，所以这里把节点原始键值内联展开，
+// 不能裹一层 data 对象。
+void publishEnvFrame(const char *buf, int len) {
+  int s = 0, e = len - 1;
+  while (s < len && buf[s] != '{') s++;
+  while (e > s && buf[e] != '}') e--;
+  if (s >= e) return;
+
+  String body = String(buf + s + 1, e - s - 1);
+  // 节点发的 "id" 键不是 PC 认识的字段，剥掉以免干扰
+  const char *idKey = "\"id\":\"";
+  int idPos = body.indexOf(idKey);
+  if (idPos >= 0) {
+    int quoteEnd = body.indexOf('"', idPos + strlen(idKey));
+    if (quoteEnd > idPos) {
+      String cleaned = body;
+      // 删掉 "id":"..." 以及紧随其后的逗号
+      int tail = quoteEnd + 1;
+      while (tail < cleaned.length() && cleaned.charAt(tail) != ',') tail++;
+      if (tail < cleaned.length()) tail++;
+      cleaned.remove(idPos, tail - idPos);
+      body = cleaned;
+    }
+  }
+
+  String p = "{\"type\":\"sensor\",\"gateway_id\":\"GW_001\",\"node_id\":\"LORA_NODE_01\",";
+  p += "\"timestamp\":" + String(millis() / 1000UL) + ",";
+  p += body;
+  p += "}";
+  bool ok = publishRaw(SENSOR_TOPIC, p);
+  Serial.print("环境帧透传: ");
+  Serial.println(ok ? "OK" : "FAIL");
+}
+
+// ---- 扫频帧 ----
+
+void publishSegment(uint8_t sg) {
+  if (!mqttClient.connected()) {
+    Serial.println("本地MQTT未连接，本段数据未上报");
+    return;
+  }
+
+  int base = sg * SEG_POINTS;
+  String p;
+  p.reserve(MQTT_BUFFER_SIZE);
+  p = "{\"type\":\"sweep\",\"gateway_id\":\"GW_001\",\"node_id\":\"LORA_NODE_01\",";
+  p += "\"report_id\":\"GW_001/LORA_NODE_01/R" + String(currentRound) + "\",";
+  p += "\"round\":" + String(currentRound);
+  p += ",\"seg\":" + String(sg);
+  p += ",\"seg_total\":" + String(SEGMENTS);
+  p += ",\"point_start\":" + String(base);
+  p += ",\"point_count\":" + String(SEG_POINTS);
+  p += ",\"ts\":" + String(millis() / 1000UL);
+
+  p += ",\"freq\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(fArr[base + i]); }
+  p += "],\"re\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(reArr[base + i]); }
+  p += "],\"im\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(imArr[base + i]); }
+  p += "],\"imp\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(impArr[base + i]); }
+  p += "],\"soil_moisture\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(soilArr[base + i]); }
+  p += "],\"temperature\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(tempX100[base + i] / 100.0, 2); }
+  p += "],\"nh3\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(nh3Arr[base + i]); }
+  p += "],\"h2s\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(h2sArr[base + i]); }
+  p += "],\"co2\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(co2Arr[base + i]); }
+  p += "],\"ph\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(phX100[base + i] / 100.0, 2); }
+  p += "],\"humidity\":[";
+  for (int i = 0; i < SEG_POINTS; i++) { if (i) p += ","; p += String(humArr[base + i]); }
+  p += "]}";
+
+  bool ok = publishRaw(SWEEP_TOPIC, p);
+  Serial.print("段MQTT上报(round=");
+  Serial.print(currentRound);
+  Serial.print(",seg=");
+  Serial.print(sg);
+  Serial.print(",");
+  Serial.print(p.length() + 1);
+  Serial.print("字节): ");
+  Serial.println(ok ? "OK" : "FAIL");
+  if (ok) { digitalWrite(LED_PIN, HIGH); delay(15); digitalWrite(LED_PIN, LOW); }
+}
+
+void publishRoundDone() {
+  if (!mqttClient.connected()) return;
+  float sumImp = 0;
+  int n = 0;
+  for (int i = 0; i < TOTAL_POINTS; i++) {
+    if (pointReady[i]) { sumImp += impArr[i]; n++; }
+  }
+  // 走 status 通道：PC 侧 parse_status 只取 status 字段，其余键原样保留
+  String p = "{\"type\":\"status\",\"gateway_id\":\"GW_001\",\"node_id\":\"LORA_NODE_01\",";
+  p += "\"status\":\"round_done\",";
+  p += "\"round\":" + String(currentRound);
+  p += ",\"points\":" + String(n);
+  p += ",\"total\":" + String(TOTAL_POINTS);
+  p += ",\"retry\":" + String(roundRetryCount);
+  p += ",\"imp_mean\":" + String(n > 0 ? sumImp / n : 0, 1);
+  p += ",\"timestamp\":" + String(millis() / 1000UL) + "}";
+  bool ok = publishRaw(STATUS_TOPIC, p);
+  Serial.print("整轮摘要上报: ");
+  Serial.println(ok ? "OK" : "FAIL");
+}
+
+// ---- 轮次管理 ----
+
+void resetRound() {
+  memset(pointReady, 0, sizeof(pointReady));
+  roundRetryCount = 0;
+}
+
+bool segReady(uint8_t sg) {
+  int base = sg * SEG_POINTS;
+  for (int i = 0; i < SEG_POINTS; i++) {
+    if (!pointReady[base + i]) return false;
+  }
+  return true;
+}
+
+bool allReady() {
+  for (int i = 0; i < TOTAL_POINTS; i++) {
+    if (!pointReady[i]) return false;
+  }
+  return true;
+}
+
+void printFullRound() {
+  Serial.print("\n======== Round ");
+  Serial.print(currentRound);
+  Serial.println(" 完整数据 100点 ========");
+  for (int i = 0; i < TOTAL_POINTS; i++) {
+    if (!pointReady[i]) continue;
+    Serial.print("pt:");
+    Serial.print(i);
+    Serial.print("/100 ");
+    Serial.print(fArr[i]);
+    Serial.print("Hz ");
+    Serial.print("re=");
+    Serial.print(reArr[i]);
+    Serial.print(" im=");
+    Serial.print(imArr[i]);
+    Serial.print(" |Z|=");
+    Serial.print(impArr[i]);
+    Serial.print(" soil=");
+    Serial.print(soilArr[i]);
+    Serial.print(" T=");
+    Serial.print(tempX100[i] / 100.0, 2);
+    Serial.print(" NH3=");
+    Serial.print(nh3Arr[i]);
+    Serial.print(" H2S=");
+    Serial.print(h2sArr[i]);
+    Serial.print(" CO2=");
+    Serial.print(co2Arr[i]);
+    Serial.print(" pH=");
+    Serial.print(phX100[i] / 100.0, 2);
+    Serial.print(" RH=");
+    Serial.println(humArr[i]);
+  }
+  Serial.print("======== Round ");
+  Serial.print(currentRound);
+  Serial.println(" 收满，开始下一轮 ========");
+}
+
+// ---- LoRa 命令 ----
+
+void sendByte(uint8_t b) {
+  LoRa.beginPacket();
+  LoRa.write(b);
+  LoRa.endPacket();
+  LoRa.receive();
+  Serial.print("下发命令: ");
+  Serial.println(b);
+}
+
+void sendRetryMask() {
+  if (roundRetryCount >= MAX_ROUND_RETRY) {
+    Serial.println("已达补发上限，放弃本轮缺点");
+    resetRound();
+    currentSeg = 0;
+    delay(600);
+    sendByte(CMD_START);
+    return;
+  }
+  roundRetryCount++;
+
+  uint8_t pkt[8];
+  pkt[0] = CMD_RETRY_MASK;
+  memset(pkt + 1, 0, 7);
+  int base = currentSeg * SEG_POINTS;
+  int cnt = 0;
+  for (int i = 0; i < SEG_POINTS; i++) {
+    if (!pointReady[base + i]) {
+      pkt[1 + (i >> 3)] |= (1 << (i & 7));
+      cnt++;
+    }
+  }
+  LoRa.beginPacket();
+  LoRa.write(pkt, 8);
+  LoRa.endPacket();
+  LoRa.receive();
+
+  Serial.print("补发缺点(第");
+  Serial.print(currentSeg + 1);
+  Serial.print("段, 第");
+  Serial.print(roundRetryCount);
+  Serial.print("次) 共");
+  Serial.println(cnt);
+}
+
+void finishRound() {
+  printFullRound();
+  publishRoundDone();
+  resetRound();
+  currentSeg = 0;
+  delay(600);
+  sendByte(CMD_START);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n==== ESP32-S3网关：节点转发 + 100点阻抗谱 + 本地MQTT上报 ====");
+  pinMode(LED_PIN, OUTPUT);
+
+  connectWifiOnce(15000);
+
+  mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+  mqttConnectLocal();
+
+  SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI);
+  pinMode(LORA_RST, OUTPUT);
+  digitalWrite(LORA_RST, LOW);
+  delay(10);
+  digitalWrite(LORA_RST, HIGH);
+  delay(20);
+
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa初始化失败");
+    while (1) delay(300);
+  }
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setCodingRate4(LORA_CR);
+  LoRa.setPreambleLength(LORA_PREAMBLE);
+  LoRa.setTxPower(LORA_TX_POWER);
+  LoRa.enableCrc();
+  LoRa.disableInvertIQ();
+  LoRa.receive();
+
+  Serial.println("==== 等待节点JSON数据 ====");
+  delay(500);
+  sendByte(CMD_START);
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWifiReconnect > WIFI_RECONNECT_INTERVAL) {
+      lastWifiReconnect = millis();
+      wifiMaintain();
+    }
+  } else {
+    mqttClient.loop();
+    if (!mqttClient.connected()) mqttConnectLocal();
+  }
+
+  if (millis() - lastHeartbeatTime > HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatTime = millis();
+    publishHeartbeat();
+  }
+
+  int pktLen = LoRa.parsePacket();
+  if (pktLen > 0 && pktLen < 300) {
+    memset(rxBuf, 0, sizeof(rxBuf));
+    int idx = 0;
+    while (LoRa.available() && idx < 299) {
+      rxBuf[idx++] = (char)LoRa.read();
+    }
+    LoRa.receive();
+
+    if (idx < 5) return;
+
+    // 环境帧：没有 round 字段 → 直接透传
+    if (!jsonHasKey(rxBuf, "round")) {
+      if (jsonHasKey(rxBuf, "soil_moisture")) publishEnvFrame(rxBuf, idx);
+      return;
+    }
+
+    // 段完成帧：done == true，节点已发完本段
+    if (jsonHasKey(rxBuf, "done")) {
+      int sg = (int)jsonField(rxBuf, "seg");
+      Serial.print("节点报告第");
+      Serial.print(sg + 1);
+      Serial.println("段发送完成");
+      if (sg >= 0 && sg < SEGMENTS) {
+        currentSeg = (uint8_t)sg;
+        if (!segReady(sg)) sendRetryMask();
+        else if (sg == 0 && currentSeg == 0) {
+          // 节点已经发完第 1 段，但网关是在收到最后一个点之后才切段的；
+          // 万一漏掉了切段事件，在这里补一次
+          currentSeg = 1;
+          publishSegment(0);
+          delay(300);
+          sendByte(CMD_NEXT);
+        }
+      }
+      return;
+    }
+
+    // 频点帧
+    long r = (long)jsonField(rxBuf, "round");
+    long sg = (long)jsonField(rxBuf, "seg");
+    long pt = (long)jsonField(rxBuf, "pt");
+    float freq = jsonField(rxBuf, "freq");
+
+    if (r >= 1 && sg >= 0 && sg < SEGMENTS && pt >= 0 && pt < SEG_POINTS && freq >= 100 && freq <= 200000) {
+      int gi = (int)sg * SEG_POINTS + (int)pt;
+      lastRxTime = millis();
+
+      if (r != currentRound) {
+        resetRound();
+        currentRound = (uint8_t)r;
+        currentSeg = (uint8_t)sg;
+        Serial.print("新轮次 Round:");
+        Serial.println(r);
+      }
+
+      if (!pointReady[gi]) {
+        fArr[gi] = (uint16_t)freq;
+        reArr[gi] = (int16_t)jsonField(rxBuf, "re");
+        imArr[gi] = (int16_t)jsonField(rxBuf, "im");
+        impArr[gi] = (uint16_t)jsonField(rxBuf, "imp");
+        soilArr[gi] = (uint8_t)jsonField(rxBuf, "soil_moisture");
+        tempX100[gi] = (int16_t)(jsonField(rxBuf, "temperature") * 100.0 + 0.5);
+        nh3Arr[gi] = (uint8_t)jsonField(rxBuf, "nh3");
+        h2sArr[gi] = (uint8_t)jsonField(rxBuf, "h2s");
+        co2Arr[gi] = (uint16_t)jsonField(rxBuf, "co2");
+        phX100[gi] = (int16_t)(jsonField(rxBuf, "ph") * 100.0 + 0.5);
+        humArr[gi] = (uint8_t)jsonField(rxBuf, "humidity");
+        pointReady[gi] = true;
+
+        Serial.print("R");
+        Serial.print(currentRound);
+        Serial.print(" seg:");
+        Serial.print(sg);
+        Serial.print(" pt:");
+        Serial.print(gi);
+        Serial.print("/100 ");
+        Serial.print(fArr[gi]);
+        Serial.print("Hz ");
+        Serial.print("re=");
+        Serial.print(reArr[gi]);
+        Serial.print(" im=");
+        Serial.print(imArr[gi]);
+        Serial.print(" |Z|=");
+        Serial.print(impArr[gi]);
+        Serial.print(" soil=");
+        Serial.print(soilArr[gi]);
+        Serial.print(" T=");
+        Serial.print(tempX100[gi] / 100.0, 2);
+        Serial.print(" NH3=");
+        Serial.print(nh3Arr[gi]);
+        Serial.print(" H2S=");
+        Serial.print(h2sArr[gi]);
+        Serial.print(" CO2=");
+        Serial.print(co2Arr[gi]);
+        Serial.print(" pH=");
+        Serial.print(phX100[gi] / 100.0, 2);
+        Serial.print(" RH=");
+        Serial.print(humArr[gi]);
+        Serial.print(" rssi=");
+        Serial.print(LoRa.packetRssi());
+        Serial.print(" snr=");
+        Serial.println(LoRa.packetSnr(), 1);
+
+        digitalWrite(LED_PIN, HIGH);
+        delay(10);
+        digitalWrite(LED_PIN, LOW);
+
+        if (allReady()) {
+          finishRound();
+        } else if (currentSeg == 0 && segReady(0)) {
+          currentSeg = 1;
+          Serial.println("第1段收满，先上报本段，再命令节点采集第2段");
+          publishSegment(0);
+          delay(300);
+          sendByte(CMD_NEXT);
+        }
+      }
+    }
+  }
+
+  if (millis() - lastReviveTime >= 1000) {
+    lastReviveTime = millis();
+    if (millis() - lastRxTime > 2500) {
+      LoRa.receive();
+    }
+  }
+
+  if (millis() - lastRxTime > ROUND_RESTART_MS) {
+    int cnt = 0;
+    for (int i = 0; i < TOTAL_POINTS; i++) {
+      if (pointReady[i]) cnt++;
+    }
+    if (cnt > 0) {
+      Serial.print("收点超时，已收");
+      Serial.print(cnt);
+      Serial.println("点，补发缺点");
+      sendRetryMask();
+    } else {
+      if (currentSeg == 0) {
+        Serial.println("收点超时，已收0点，重新下发启动命令");
+        sendByte(CMD_START);
+      } else {
+        Serial.println("第2段0点，重新下发下一段命令");
+        sendByte(CMD_NEXT);
+      }
+    }
+    lastRxTime = millis();
+  }
+  delay(10);
+}
