@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from db import Database
 from gui import MainWindow
 from mqtt_client import MQTTWorker, SimulatorWorker
+import theme
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -47,6 +48,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("Fruit Monitor")
+    theme.apply(app)
 
     worker: QThread
     if use_simulator:
