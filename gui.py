@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import collections
+import json
 import math
 import time
 from datetime import datetime
@@ -13,6 +14,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QMainWindow,
     QWidget,
     QVBoxLayout,
@@ -66,15 +68,9 @@ SENSOR_FIELDS: list[tuple[str, str, str, int]] = [
     ("soil_moisture", "土壤湿度", "%", 1),
 ]
 
-SENSOR_COLORS: dict[str, str] = {
-    "temperature": "#ffd60a",
-    "humidity": "#0a84ff",
-    "co2": "#30d158",
-    "ph": "#ff453a",
-    "nh3": "#64d2ff",
-    "h2s": "#ff9f0a",
-    "soil_moisture": "#bf5af2",
-}
+def SENSOR_COLORS() -> dict[str, str]:
+    """七个传感器曲线配色，跟当前主题走。"""
+    return {key: theme.sensor_color(key) for key, *_ in SENSOR_FIELDS}
 
 # 历史数据表的列序与显示精度。顺序是显式声明的，不受 sqlite ALTER TABLE
 # 把新列追加到末尾的影响；表头保持字段原名。
@@ -103,20 +99,33 @@ SENSOR_HISTORY_DECIMALS: dict[str, int] = {
 }
 
 
-TREND_UP = "#ff453a"
-TREND_DOWN = "#30d158"
-TREND_FLAT = "#8a9099"
+# 项目约定「红涨绿跌」，而 theme 的 ok/bad 按颜色命名（ok=绿，bad=红），
+# 所以这里做一次显式映射，别在调用点写反。
+_TREND_TOKEN = {"up": "bad", "down": "ok", "flat": "flat"}
+
+
+def trend_color(kind: str) -> str:
+    """kind: up(涨) / down(跌) / flat(持平)。"""
+    return theme.C(_TREND_TOKEN[kind])
+
+
+def trend_token(kind: str) -> str:
+    return _TREND_TOKEN[kind]
+
 
 NYQUIST_COLORMAP = "viridis"
-BODE_MAG_COLOR = "#0a84ff"
-BODE_PHASE_COLOR = "#ff6b63"
 
-MATURITY_COLORS: dict[str, str] = {
-    "unripe": "#0a84ff",
-    "ripening": "#30d158",
-    "ripe": "#ffd60a",
-    "overripe": "#ff6b63",
-}
+
+def bode_mag_color() -> str:
+    return theme.C("bode_mag")
+
+
+def bode_phase_color() -> str:
+    return theme.C("bode_phase")
+
+
+def maturity_color(level: str) -> str:
+    return theme.maturity_color(level)
 
 MATURITY_ORDER: list[tuple[str, str]] = [
     ("unripe", "未成熟"),
@@ -145,10 +154,10 @@ class StatusLight(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self._dot = QLabel("●")
-        self._dot.setStyleSheet("font-size:14px; color:#6b7280;")
+        self._dot.setStyleSheet(f"font-size:14px; color:{theme.C('text_muted')};")
         lay.addWidget(self._dot)
         self._text = QLabel(self._label)
-        self._text.setStyleSheet("font-size:11px; color:#9ca3af;")
+        self._text.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
         lay.addWidget(self._text)
         lay.addStretch()
 
@@ -223,7 +232,7 @@ class ArcGauge(QWidget):
         super().__init__(parent)
         self._value = 0.0
         self._caption = "0%"
-        self._color = "#8a9099"
+        self._color = theme.C('flat')
         self.setMinimumSize(200, 120)
 
     def set_value(self, value: float, caption: str = "", color: str = "") -> None:
@@ -244,7 +253,7 @@ class ArcGauge(QWidget):
 
         bg = QPen(Qt.GlobalColor.transparent)
         bg.setWidthF(13)
-        bg.setColor(pg.mkColor("#1affffff"))
+        bg.setColor(pg.mkColor(theme.C('border')))
         bg.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(bg)
         painter.drawArc(rect, 180 * 16, -180 * 16)
@@ -271,28 +280,30 @@ class SensorCard(QFrame):
         super().__init__(parent)
         self._unit = unit
         self._prev_value: float | None = None
+        self._trend_key = "flat"   # trend_color() 的入参，换主题时按它重建胶囊
+        self._is_anomaly = False
         # 卡内实际只有标题、数值、趋势三行，180 高留了快一倍空白；
         # 两行卡片白占 360，把下面图区挤到只剩百来像素。
         self.setFixedHeight(140)
         self._apply_style(normal=True)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setContentsMargins(16, 14, 16, 14)
         self._name_label = QLabel(name)
         self._name_label.setStyleSheet(
-            f"color:{theme.TEXT_SECONDARY}; font-size:12px; font-weight:500;")
+            f"color:{theme.C('text_secondary')}; font-size:13px; font-weight:500;")
         lay.addWidget(self._name_label)
 
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         self._value_label = QLabel("--")
-        # 数字用等宽字族：刷新时不横向跳动；30px 加粗，是全页视觉重心。
-        self._value_label.setStyleSheet(theme.num_qss(30, 700, theme.TEXT_PRIMARY))
+        # 数字用等宽字族：刷新时不横向跳动；28px Semi-bold，是全页视觉重心。
+        self._value_label.setStyleSheet(theme.num_qss(28, 600))
         row.addWidget(self._value_label)
         if unit:
             self._unit_label = QLabel(unit)
             self._unit_label.setStyleSheet(
-                f"color:{theme.TEXT_MUTED}; font-size:12px; margin-left:5px;")
+                f"color:{theme.C('text_muted')}; font-size:13px; margin-left:6px;")
             row.addWidget(self._unit_label)
         row.addStretch()
         lay.addLayout(row)
@@ -300,12 +311,12 @@ class SensorCard(QFrame):
         bottom = QHBoxLayout()
         bottom.setContentsMargins(0, 0, 0, 0)
         self._trend_label = QLabel("—")
-        self._trend_label.setStyleSheet(_trend_pill_qss(TREND_FLAT))
+        self._trend_label.setStyleSheet(_trend_pill_qss(trend_color('flat')))
         bottom.addWidget(self._trend_label)
         bottom.addStretch()
         self._anomaly_label = QLabel("")
         self._anomaly_label.setStyleSheet(
-            f"color:{theme.DOWN}; font-size:10px;")
+            f"color:{theme.C('bad')}; font-size:10px;")
         bottom.addWidget(self._anomaly_label)
         lay.addLayout(bottom)
 
@@ -328,45 +339,80 @@ class SensorCard(QFrame):
 
         self._prev_value = current
         self._update_trend(prev, current)
+        self._is_anomaly = bool(anomaly)
         self._apply_style(normal=not anomaly)
 
     def _update_trend(self, prev: float | None, current: float | None) -> None:
         if prev is None or current is None:
+            self._trend_key = "flat"
             self._trend_label.setText("—")
-            self._trend_label.setStyleSheet(_trend_pill_qss(TREND_FLAT))
+            self._trend_label.setStyleSheet(_trend_pill_qss(trend_color('flat')))
             return
         delta = current - prev
         if abs(delta) < 1e-9:
-            text, color = "— 持平", TREND_FLAT
+            text, self._trend_key = "— 持平", "flat"
         elif delta > 0:
-            text, color = f"▲ +{abs(delta):g}", TREND_UP
+            text, self._trend_key = f"▲ +{abs(delta):g}", "up"
         else:
-            text, color = f"▼ {delta:g}", TREND_DOWN
+            text, self._trend_key = f"▼ {delta:g}", "down"
         self._trend_label.setText(text)
-        self._trend_label.setStyleSheet(_trend_pill_qss(color))
+        self._trend_label.setStyleSheet(_trend_pill_qss(trend_color(self._trend_key)))
+
+    def refresh_theme(self) -> None:
+        """主题切换后重建卡片的底/边/阴影和卡内文字配色。
+
+        不能靠十六进制色替换：#ffffff 在一套主题里被好几个 token 共用，
+        替换表一定会把「白色卡片底」错配成别的颜色。
+        """
+        self._apply_style(normal=not self._is_anomaly)
+        self._name_label.setStyleSheet(
+            f"color:{theme.C('text_secondary')}; font-size:13px; font-weight:500;")
+        self._value_label.setStyleSheet(theme.num_qss(28, 600))
+        if hasattr(self, "_unit_label"):
+            self._unit_label.setStyleSheet(
+                f"color:{theme.C('text_muted')}; font-size:13px; margin-left:6px;")
+        self._trend_label.setStyleSheet(_trend_pill_qss(trend_color(self._trend_key)))
+        self._anomaly_label.setStyleSheet(
+            f"color:{theme.C('bad')}; font-size:10px;")
 
     def set_anomaly_text(self, text: str) -> None:
         self._anomaly_label.setText(text)
 
     def _apply_style(self, normal: bool) -> None:
+        # 浅色主题：白纸卡片 + 扩散阴影；异常态换成浅红底提醒。
+        # 这里用 % 格式化而不是 f 字符串——CSS 选择器的花括号和插值花括号
+        # 混在 f 字符串里会互相踩，跨串拆分时尤其容易报 single '}' 语法错。
+        shadow = str(theme.C("card_shadow") or "").strip()
+        shadow_qss = "box-shadow:%s;" % shadow if shadow else ""
         if normal:
-            # hover 时边框亮一点，是这张卡片唯一可点的反馈。
+            # hover 时边框换主色，是这张卡片唯一可点的反馈。
             self.setStyleSheet(
-                "SensorCard{background:#0effffff;border-radius:12px;"
-                "border:1px solid #1affffff;}"
-                "SensorCard:hover{border:1px solid #2e0a84ff;}"
+                "SensorCard{background:%s;border-radius:12px;"
+                "border:1px solid %s;%s}"
+                "SensorCard:hover{border:1px solid %s;}"
+                % (
+                    theme.C("card_fill"),
+                    theme.C("card_border"),
+                    shadow_qss,
+                    theme.alpha_soft(theme.C("accent"), 0x55),
+                )
             )
         else:
             self.setStyleSheet(
-                "SensorCard{background:#26ff453a;border-radius:12px;"
-                "border:1px solid #66ff453a;}"
+                "SensorCard{background:%s;border-radius:12px;"
+                "border:1px solid %s;%s}"
+                % (
+                    theme.alpha_soft(theme.C("bad"), 0x26),
+                    theme.alpha_soft(theme.C("bad"), 0x66),
+                    shadow_qss,
+                )
             )
 
 
 def _trend_pill_qss(color: str) -> str:
     """趋势胶囊样式。
 
-    项目在语义上沿用红涨绿跌（TREND_UP 是红），和 theme 里通用的
+    项目在语义上沿用红涨绿跌（trend_color('up') 是红），和 theme 里通用的
     pillUp/pillDown 配色相反，所以这里不能用 #pillUp 那一套，自己拼。
     """
     return (
@@ -414,7 +460,7 @@ class RealTimeChart(QWidget):
 
         # 面积渐变垫在曲线下面，先把填充项加进去再加盖折线。
         for key, label, unit, _ in SENSOR_FIELDS:
-            color = SENSOR_COLORS[key]
+            color = theme.sensor_color(key)
             fill = pg.PlotDataItem(
                 pen=None,
                 brush=theme.area_brush(color, 0x40),
@@ -478,6 +524,15 @@ class RealTimeChart(QWidget):
     def _on_mode_changed(self, state: int) -> None:
         self._multi_mode = bool(state)
         self._update_curves()
+
+    def refresh_theme(self) -> None:
+        """主题切换后重刷图表底色、网格、曲线和面积渐变配色。"""
+        theme.style_plot(self._plot, x_grid=False, y_grid=True, grid_alpha=0.12)
+        for key, _label, _unit, _th in SENSOR_FIELDS:
+            color = theme.sensor_color(key)
+            self._curves[key].setPen(pg.mkPen(color, width=2.5, cosmetic=True))
+            self._fills[key].setBrush(theme.area_brush(color, 0x40))
+        self.update()
 
     def clear(self) -> None:
         for key in self._data:
@@ -616,7 +671,7 @@ class SweepDialog(QDialog):
         lay.addLayout(query)
 
         self._info_label = QLabel("等待加载...")
-        self._info_label.setStyleSheet("font-size:12px; color:#9ca3af;")
+        self._info_label.setStyleSheet(f"font-size:12px; color:{theme.C('text_secondary')};")
         lay.addWidget(self._info_label)
 
         self._table = QTableWidget()
@@ -866,7 +921,7 @@ class ImpedanceDialog(QDialog):
         lay.addLayout(query)
 
         self._info_label = QLabel("等待加载...")
-        self._info_label.setStyleSheet("font-size:12px; color:#9ca3af;")
+        self._info_label.setStyleSheet(f"font-size:12px; color:{theme.C('text_secondary')};")
         lay.addWidget(self._info_label)
 
         self._table = QTableWidget()
@@ -894,7 +949,7 @@ class ImpedanceDialog(QDialog):
         round_lay = QVBoxLayout(round_box)
         round_lay.setContentsMargins(8, 6, 8, 6)
         self._round_info = QLabel("")
-        self._round_info.setStyleSheet("font-size:12px; font-weight:700; color:#9ca3af;")
+        self._round_info.setStyleSheet(f"font-size:12px; font-weight:700; color:{theme.C('text_secondary')};")
         round_lay.addWidget(self._round_info)
         self._round_table = QTableWidget(0, 7)
         self._round_table.setAlternatingRowColors(True)
@@ -981,14 +1036,14 @@ class ImpedanceDialog(QDialog):
             if points is None:
                 # 固件整轮摘要先回来、本地一段都没落库：这轮我们还没有证据，
                 # 既不能说完整也不能说缺了多少点。
-                state, color, missing_cell = "未落库", "#8a9099", "—"
+                state, color, missing_cell = "未落库", theme.C('flat'), "—"
             elif complete:
-                state, color = "完整", "#30d158"
+                state, color = "完整", theme.C('ok')
                 missing_cell = str(missing) if missing else "—"
             elif missing:
-                state, color, missing_cell = f"缺 {missing} 点", "#ff453a", str(missing)
+                state, color, missing_cell = f"缺 {missing} 点", theme.C('bad'), str(missing)
             else:
-                state, color, missing_cell = "未知", "#8a9099", "—"
+                state, color, missing_cell = "未知", theme.C('flat'), "—"
             when = row.get("last_ts") or row.get("first_ts") or row.get("recorded_at")
             when = (datetime.fromtimestamp(when).strftime("%m-%d %H:%M:%S")
                     if when else "")
@@ -1004,7 +1059,7 @@ class ImpedanceDialog(QDialog):
             ]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                item.setForeground(QBrush(QColor("#2b2f33")))
+                item.setForeground(QBrush(QColor(theme.C('text_primary'))))
                 if c == 5:
                     item.setForeground(QBrush(QColor(color)))
                 self._round_table.setItem(r, c, item)
@@ -1025,7 +1080,7 @@ class ImpedanceDialog(QDialog):
             self._round_info.setText(text)
             self._round_info.setStyleSheet(
                 "font-size:12px; font-weight:700; color:"
-                f"{'#ff453a' if bad else '#30d158'};")
+                f"{theme.C('bad') if bad else theme.C('ok')};")
 
     def _render_page(self) -> None:
         page_size, page = page_geometry(self._page_size_box, self._page)
@@ -1168,7 +1223,7 @@ class HistoryDialog(QDialog):
         lay.addLayout(query)
 
         self._info_label = QLabel("等待加载...")
-        self._info_label.setStyleSheet("font-size:12px; color:#9ca3af;")
+        self._info_label.setStyleSheet(f"font-size:12px; color:{theme.C('text_secondary')};")
         lay.addWidget(self._info_label)
 
         self._table = QTableWidget()
@@ -1180,7 +1235,7 @@ class HistoryDialog(QDialog):
         self._note_label = QLabel(
             "阻抗列为该次测量的有效频段均值，不是一根频点；"
             "frequency_hz 留空表示不对应单一频率")
-        self._note_label.setStyleSheet("font-size:11px; color:#9ca3af;")
+        self._note_label.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
         btn_row.addWidget(self._note_label)
         btn_row.addStretch()
         self._all_btn = QPushButton("全选行")
@@ -1383,11 +1438,11 @@ class EISPanel(QWidget):
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         self._info = QLabel("等待扫频数据…")
-        self._info.setStyleSheet("font-size:12px; color:#9ca3af; font-weight:600;")
+        self._info.setStyleSheet(f"font-size:12px; color:{theme.C('text_secondary')}; font-weight:600;")
         header.addWidget(self._info)
         header.addStretch()
         self._legend = QLabel("点颜色：深→浅 表示频率 低→高")
-        self._legend.setStyleSheet("font-size:11px; color:#9ca3af;")
+        self._legend.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
         header.addWidget(self._legend)
         lay.addLayout(header)
 
@@ -1396,12 +1451,12 @@ class EISPanel(QWidget):
 
         nyq_frame = QFrame()
         nyq_frame.setStyleSheet(
-            "QFrame{background:#0effffff;border-radius:10px;border:1px solid #1affffff;}"
+            "QFrame{background:%s;border-radius:10px;border:1px solid %s;}" % (theme.C("card_fill"), theme.C("card_border"))
         )
         nyq_lay = QVBoxLayout(nyq_frame)
         nyq_lay.setContentsMargins(8, 8, 8, 8)
         nyq_title = QLabel("Nyquist 轨迹")
-        nyq_title.setStyleSheet("font-size:12px; font-weight:700; color:#f3f4f6;")
+        nyq_title.setStyleSheet(f"font-size:12px; font-weight:700; color:{theme.C('text_primary')};")
         nyq_lay.addWidget(nyq_title)
 
         self._nyq_plot = pg.PlotWidget()
@@ -1412,7 +1467,7 @@ class EISPanel(QWidget):
         self._nyq_plot.setMinimumHeight(120)
         self._scatter = pg.ScatterPlotItem(size=9, pen=pg.mkPen(width=0))
         self._scatter.setSymbol("o")
-        self._scatter.setPen(pg.mkPen("#ffffff", width=1))
+        self._scatter.setPen(pg.mkPen(theme.C('scatter_pen'), width=1))
         self._nyq_plot.addItem(self._scatter)
         nyq_lay.addWidget(self._nyq_plot)
         self._hint = FirstFrameHint("等待整轮扫频完成…", self._nyq_plot)
@@ -1421,12 +1476,12 @@ class EISPanel(QWidget):
 
         bode_frame = QFrame()
         bode_frame.setStyleSheet(
-            "QFrame{background:#0effffff;border-radius:10px;border:1px solid #1affffff;}"
+            "QFrame{background:%s;border-radius:10px;border:1px solid %s;}" % (theme.C("card_fill"), theme.C("card_border"))
         )
         bode_lay = QVBoxLayout(bode_frame)
         bode_lay.setContentsMargins(8, 8, 8, 8)
         bode_title = QLabel("Bode 图")
-        bode_title.setStyleSheet("font-size:12px; font-weight:700; color:#f3f4f6;")
+        bode_title.setStyleSheet(f"font-size:12px; font-weight:700; color:{theme.C('text_primary')};")
         bode_lay.addWidget(bode_title)
 
         self._bode_plot = pg.PlotWidget()
@@ -1434,20 +1489,20 @@ class EISPanel(QWidget):
         bode_item = self._bode_plot.getPlotItem()
         for axis in ("bottom", "top", "left", "right"):
             bode_item.getAxis(axis).setStyle(showValues=True)
-        self._bode_plot.setLabel("left", "|Z| (Ω)", color=BODE_MAG_COLOR)
-        self._bode_plot.setLabel("right", "相位 (°)", color=BODE_PHASE_COLOR)
+        self._bode_plot.setLabel("left", "|Z| (Ω)", color=bode_mag_color())
+        self._bode_plot.setLabel("right", "相位 (°)", color=bode_phase_color())
         self._bode_plot.setLabel("bottom", "频率 (Hz)", position=1)
         self._bode_plot.setLogMode(x=True, y=False)
         self._bode_plot.setMinimumHeight(120)
         self._mag_curve = bode_item.plot(
-            pen=pg.mkPen(BODE_MAG_COLOR, width=2),
+            pen=pg.mkPen(bode_mag_color(), width=2),
             symbol="o",
             symbolSize=5,
             name="|Z|",
         )
         self._mag_curve.setDownsampling()
         self._phase_curve = pg.PlotDataItem(
-            pen=pg.mkPen(BODE_PHASE_COLOR, width=2), name="相位"
+            pen=pg.mkPen(bode_phase_color(), width=2), name="相位"
         )
         bode_item.addItem(self._phase_curve, y="right")
         self._bode_plot.addLegend(offset=(6, 6), labelTextSize="10px")
@@ -1455,6 +1510,21 @@ class EISPanel(QWidget):
         body.addWidget(bode_frame, stretch=1)
 
         lay.addLayout(body, stretch=1)
+
+    def refresh_theme(self) -> None:
+        """主题切换后重刷 Nyquist / Bode 的底色、网格、标签和曲线配色。"""
+        theme.style_plot(self._nyq_plot, x_grid=True, y_grid=True, grid_alpha=0.06)
+        theme.style_plot(self._bode_plot, x_grid=True, y_grid=True, grid_alpha=0.06)
+        self._info.setStyleSheet(
+            f"font-size:12px; color:{theme.C('text_secondary')}; font-weight:600;")
+        self._legend.setStyleSheet(
+            f"font-size:11px; color:{theme.C('text_secondary')};")
+        self._scatter.setPen(pg.mkPen(theme.C('scatter_pen'), width=1))
+        self._bode_plot.setLabel("left", "|Z| (Ω)", color=bode_mag_color())
+        self._bode_plot.setLabel("right", "相位 (°)", color=bode_phase_color())
+        self._mag_curve.setPen(pg.mkPen(bode_mag_color(), width=2))
+        self._phase_curve.setPen(pg.mkPen(bode_phase_color(), width=2))
+        self.update()
 
     def _analysis_band(self) -> tuple[float, float]:
         """分析频段从 config.json 的 maturity 段读，别在代码里写死。"""
@@ -1521,8 +1591,8 @@ class EISPanel(QWidget):
                 headLen=9,
                 tipAngle=26,
                 pxMode=True,
-                pen=pg.mkPen("#9ca3af", width=1),
-                brush=pg.mkBrush("#9ca3af"),
+                pen=pg.mkPen(theme.C('text_secondary'), width=1),
+                brush=pg.mkBrush(theme.C('text_secondary')),
             )
             self._nyq_plot.addItem(arrow)
             self._arrows.append(arrow)
@@ -1532,7 +1602,7 @@ class EISPanel(QWidget):
         self._annotations.clear()
         for idx in (0, len(xs) - 1):
             text = pg.TextItem(
-                f"{freqs[idx] / 1000.0:.2f} kHz", color="#5a6068", anchor=(0, 1)
+                f"{freqs[idx] / 1000.0:.2f} kHz", color=theme.C('text_secondary'), anchor=(0, 1)
             )
             self._nyq_plot.addItem(text, x=xs[idx], y=ys[idx])
             self._annotations.append(text)
@@ -1563,7 +1633,7 @@ class EISPanel(QWidget):
         if f_c is not None:
             for x, y, f in zip(xs, ys, freqs):
                 if f == f_c:
-                    mark = pg.TextItem("f_c", color="#ff453a", anchor=(0, 1))
+                    mark = pg.TextItem("f_c", color=theme.C('bad'), anchor=(0, 1))
                     self._nyq_plot.addItem(mark, x=x, y=y)
                     self._fc_marks.append(mark)
                     break
@@ -1588,13 +1658,13 @@ class MaturityPanel(QWidget):
         self._gauge = ArcGauge()
         left.addWidget(self._gauge)
         self._confidence_label = QLabel("置信度 --")
-        self._confidence_label.setStyleSheet("font-size:12px; color:#9ca3af;")
+        self._confidence_label.setStyleSheet(f"font-size:12px; color:{theme.C('text_secondary')};")
         left.addWidget(self._confidence_label)
         body.addLayout(left)
 
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.VLine)
-        divider.setStyleSheet("color:#1affffff;")
+        divider.setStyleSheet(f"color:{theme.C('border')};")
         body.addWidget(divider)
 
         right = QVBoxLayout()
@@ -1602,14 +1672,14 @@ class MaturityPanel(QWidget):
         right.addWidget(self._make_step_header())
 
         self._level_label = QLabel("--")
-        self._level_label.setStyleSheet("font-size:22px; font-weight:700; color:#9ca3af;")
+        self._level_label.setStyleSheet(f"font-size:22px; font-weight:700; color:{theme.C('text_secondary')};")
         right.addWidget(self._level_label)
 
         self._maturity_label = QLabel("成熟度进度 --")
-        self._maturity_label.setStyleSheet("font-size:13px; color:#9ca3af;")
+        self._maturity_label.setStyleSheet(f"font-size:13px; color:{theme.C('text_secondary')};")
         right.addWidget(self._maturity_label)
         self._harvest_label = QLabel("预计采摘 --")
-        self._harvest_label.setStyleSheet("font-size:13px; color:#9ca3af;")
+        self._harvest_label.setStyleSheet(f"font-size:13px; color:{theme.C('text_secondary')};")
         right.addWidget(self._harvest_label)
 
         hint_wrap = QWidget()
@@ -1633,7 +1703,7 @@ class MaturityPanel(QWidget):
 
     def _make_step_header(self) -> QLabel:
         title = QLabel("实验阶段")
-        title.setStyleSheet("font-size:12px; font-weight:700; color:#f3f4f6;")
+        title.setStyleSheet(f"font-size:12px; font-weight:700; color:{theme.C('text_primary')};")
         return title
 
     @staticmethod
@@ -1641,23 +1711,23 @@ class MaturityPanel(QWidget):
         frame = QFrame()
         frame.setFixedHeight(56)
         frame.setStyleSheet(
-            "QFrame{background:#0bffffff;border-radius:8px;border:1px solid #14ffffff;}"
+            "QFrame{background:%s;border-radius:8px;border:1px solid %s;}" % (theme.C("glass_bg"), theme.C("border"))
         )
         inner = QVBoxLayout(frame)
         inner.setContentsMargins(10, 8, 10, 8)
         bar = QFrame()
         bar.setFixedHeight(5)
-        bar.setStyleSheet("QFrame{background:#1affffff;border-radius:3px;}")
+        bar.setStyleSheet(f"QFrame{{background:{theme.C('inset')};border-radius:3px;}}")
         inner.addWidget(bar)
         label = QLabel(text)
-        label.setStyleSheet("font-size:11px; color:#9ca3af;")
+        label.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
         inner.addWidget(label)
         return frame, bar, label
 
     def set_prediction(self, prediction: PredictionData) -> None:
         self._hint.dismiss()
         level = prediction.maturity_level or "unripe"
-        color = MATURITY_COLORS.get(level, "#8a9099")
+        color = maturity_color(level)
         progress = float(prediction.maturity or 0.0)
         confidence = float(prediction.confidence or 0.0)
 
@@ -1674,22 +1744,25 @@ class MaturityPanel(QWidget):
         for index, (frame, bar, label) in enumerate(self._steps):
             if index == active:
                 frame.setStyleSheet(
-                    "QFrame{background:#0effffff;border-radius:8px;border:1px solid #1affffff;}"
+                    "QFrame{background:%s;border-radius:8px;border:1px solid %s;}"
+                    % (theme.C("glass_bg_strong"), theme.C("card_border"))
                 )
                 bar.setStyleSheet(f"QFrame{{background:{color};border-radius:3px;}}")
                 label.setStyleSheet(f"font-size:11px; color:{color}; font-weight:700;")
             elif index < active:
                 frame.setStyleSheet(
-                    "QFrame{background:#0bffffff;border-radius:8px;border:1px solid #14ffffff;}"
+                    "QFrame{background:%s;border-radius:8px;border:1px solid %s;}"
+                    % (theme.C("glass_bg"), theme.C("border"))
                 )
-                bar.setStyleSheet("QFrame{background:#33000000;border-radius:3px;}")
-                label.setStyleSheet("font-size:11px; color:#9ca3af;")
+                bar.setStyleSheet(f"QFrame{{background:{theme.C('inset')};border-radius:3px;}}")
+                label.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
             else:
                 frame.setStyleSheet(
-                    "QFrame{background:#0bffffff;border-radius:8px;border:1px solid #14ffffff;}"
+                    "QFrame{background:%s;border-radius:8px;border:1px solid %s;}"
+                    % (theme.C("glass_bg"), theme.C("border"))
                 )
-                bar.setStyleSheet("QFrame{background:#1affffff;border-radius:3px;}")
-                label.setStyleSheet("font-size:11px; color:#9ca3af;")
+                bar.setStyleSheet(f"QFrame{{background:{theme.C('inset')};border-radius:3px;}}")
+                label.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
 
 
 class LiveSweepWindow(QDialog):
@@ -1732,11 +1805,11 @@ class LiveSweepWindow(QDialog):
         meta = QHBoxLayout()
         meta.addWidget(QLabel("报文:"))
         self._report_label = QLabel("—")
-        self._report_label.setStyleSheet("font-size:12px; font-weight:700; color:#f3f4f6;")
+        self._report_label.setStyleSheet(f"font-size:12px; font-weight:700; color:{theme.C('text_primary')};")
         meta.addWidget(self._report_label)
         meta.addWidget(QLabel("点:"))
         self._count_label = QLabel("0 / 0")
-        self._count_label.setStyleSheet("font-size:12px; font-weight:700; color:#f3f4f6;")
+        self._count_label.setStyleSheet(f"font-size:12px; font-weight:700; color:{theme.C('text_primary')};")
         meta.addWidget(self._count_label)
         meta.addWidget(QLabel("进度"))
         self._progress = QProgressBar()
@@ -1746,10 +1819,10 @@ class LiveSweepWindow(QDialog):
         self._progress.setTextVisible(True)
         meta.addWidget(self._progress)
         self._state_label = QLabel("等待数据")
-        self._state_label.setStyleSheet("font-size:12px; font-weight:700; color:#9ca3af;")
+        self._state_label.setStyleSheet(f"font-size:12px; font-weight:700; color:{theme.C('text_secondary')};")
         meta.addWidget(self._state_label)
         self._summary_label = QLabel("")
-        self._summary_label.setStyleSheet("font-size:11px; color:#9ca3af;")
+        self._summary_label.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
         meta.addWidget(self._summary_label)
         meta.addStretch()
         self._auto_chk = QCheckBox("报文到达自动刷新")
@@ -1783,16 +1856,16 @@ class LiveSweepWindow(QDialog):
         bode_item = self._bode_plot.getPlotItem()
         for axis in ("bottom", "top", "left", "right"):
             bode_item.getAxis(axis).setStyle(showValues=True)
-        self._bode_plot.setLabel("left", "|Z| (Ω)", color=BODE_MAG_COLOR)
-        self._bode_plot.setLabel("right", "相位 (°)", color=BODE_PHASE_COLOR)
+        self._bode_plot.setLabel("left", "|Z| (Ω)", color=bode_mag_color())
+        self._bode_plot.setLabel("right", "相位 (°)", color=bode_phase_color())
         self._bode_plot.setLabel("bottom", "频率 (Hz)", position=1)
         self._bode_plot.setLogMode(x=True, y=False)
         self._mag_curve = bode_item.plot(
-            pen=pg.mkPen(BODE_MAG_COLOR, width=2), symbol="o", symbolSize=5, name="|Z|"
+            pen=pg.mkPen(bode_mag_color(), width=2), symbol="o", symbolSize=5, name="|Z|"
         )
         self._mag_curve.setDownsampling()
         self._phase_curve = pg.PlotDataItem(
-            pen=pg.mkPen(BODE_PHASE_COLOR, width=2), name="相位"
+            pen=pg.mkPen(bode_phase_color(), width=2), name="相位"
         )
         bode_item.addItem(self._phase_curve, y="right")
         self._bode_plot.addLegend(offset=(6, 6), labelTextSize="10px")
@@ -1994,15 +2067,15 @@ class LiveSweepWindow(QDialog):
             0, min(self._min_points,
                    int(round(self._min_points * buffered / max(1, total))))))
         if round_complete:
-            text, color = "整轮已满", "#30d158"
+            text, color = "整轮已满", theme.C('ok')
         elif total > self._min_points:
             # 报文本身够数，但整轮还没收齐：网关一轮 100 点拆 2 段，
             # 第一段到这里就停了，得告诉用户还差多少。
-            text, color = f"本轮 {buffered}/{total} 点", "#0a84ff"
+            text, color = f"本轮 {buffered}/{total} 点", theme.C('accent')
         elif segment_complete:
-            text, color = "本报文已满", "#30d158"
+            text, color = "本报文已满", theme.C('ok')
         else:
-            text, color = f"本报文不足 {self._min_points} 点", "#ff453a"
+            text, color = f"本报文不足 {self._min_points} 点", theme.C('bad')
         self._state_label.setText(text)
         self._state_label.setStyleSheet(
             f"font-size:12px; font-weight:700; color:{color};"
@@ -2038,7 +2111,7 @@ class LiveSweepWindow(QDialog):
         missing = None
         if points is not None and total:
             missing = max(0, int(total) - int(points))
-        color = "#30d158" if not missing else "#ff453a"
+        color = theme.C('ok') if not missing else theme.C('bad')
         text = f"整轮确认：" + " · ".join(bits)
         if missing:
             text += f" · 缺 {missing} 点"
@@ -2097,9 +2170,9 @@ class LiveSweepWindow(QDialog):
                 item = QTableWidgetItem(
                     f"{value:.{prec}f}" if value is not None else ""
                 )
-                item.setForeground(QBrush(QColor("#2b2f33")))
+                item.setForeground(QBrush(QColor(theme.C('text_primary'))))
                 if key == "point_index":
-                    item.setForeground(QBrush(QColor("#0a84ff")))
+                    item.setForeground(QBrush(QColor(theme.C('accent'))))
                 self._table.setItem(r, c, item)
 
     # ---- 动作 ----
@@ -2176,6 +2249,8 @@ class MainWindow(QMainWindow):
             config.get("heartbeat", {}).get("stale_after_s", 45.0))
 
         ui_cfg = config.get("ui", {})
+        self._config_path: Optional[str] = config.get("_config_path")
+        self._theme_name = theme.current_name()
         self.setWindowTitle("水果成熟度实时监测系统")
         self.resize(ui_cfg.get("window_width", 1280), ui_cfg.get("window_height", 860))
 
@@ -2208,34 +2283,43 @@ class MainWindow(QMainWindow):
     # ---- 构建 UI ----
 
     def _build_header(self) -> QFrame:
-        bar = theme.GlassCard(radius=12, background=theme.GLASS_BG_STRONG)
+        bar = theme.GlassCard(radius=12, background=theme.C('glass_bg_strong'))
         bar.setFixedHeight(52)
         lay = QHBoxLayout(bar.body)
         lay.setContentsMargins(16, 0, 16, 0)
 
         self._title = QLabel("水果成熟度实时监测系统")
         self._title.setStyleSheet(
-            f"font-size:16px; font-weight:700; color:{theme.TEXT_PRIMARY};")
+            f"font-size:16px; font-weight:700; color:{theme.C('text_primary')};")
         lay.addWidget(self._title)
         lay.addStretch()
 
+        # 主题开关放最右侧：一键在浅色 SaaS 和深色玻璃拟态之间切换。
+        self._theme_btn = QPushButton("深色")
+        self._theme_btn.setObjectName("btnGhost")
+        self._theme_btn.setFixedWidth(62)
+        self._theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._theme_btn.setToolTip("切换浅色 / 深色主题")
+        self._theme_btn.clicked.connect(self._toggle_theme)
+        lay.addWidget(self._theme_btn)
+
         self._gw_label = QLabel("网关: --")
-        self._gw_label.setStyleSheet(f"font-size:12px; color:{theme.TEXT_SECONDARY};")
+        self._gw_label.setStyleSheet(f"font-size:12px; color:{theme.C('text_secondary')};")
         lay.addWidget(self._gw_label)
 
         self._node_label = QLabel("节点: --")
-        self._node_label.setStyleSheet(f"font-size:12px; color:{theme.TEXT_SECONDARY};")
+        self._node_label.setStyleSheet(f"font-size:12px; color:{theme.C('text_secondary')};")
         lay.addWidget(self._node_label)
 
         self._status_light = StatusLight()
         lay.addWidget(self._status_light)
 
         self._gw_info_label = QLabel("网关: 未上报")
-        self._gw_info_label.setStyleSheet(f"font-size:11px; color:{theme.TEXT_MUTED};")
+        self._gw_info_label.setStyleSheet(f"font-size:11px; color:{theme.C('text_muted')};")
         lay.addWidget(self._gw_info_label)
 
         self._update_label = QLabel("更新: --")
-        self._update_label.setStyleSheet(f"font-size:11px; color:{theme.TEXT_MUTED};")
+        self._update_label.setStyleSheet(f"font-size:11px; color:{theme.C('text_muted')};")
         lay.addWidget(self._update_label)
 
         return bar
@@ -2283,7 +2367,7 @@ class MainWindow(QMainWindow):
         return wrap
 
     def _build_controls(self) -> QFrame:
-        bar = theme.GlassCard(radius=12, background=theme.GLASS_BG_STRONG)
+        bar = theme.GlassCard(radius=12, background=theme.C('glass_bg_strong'))
         bar.setFixedHeight(56)
         lay = QHBoxLayout(bar.body)
         lay.setContentsMargins(12, 4, 12, 4)
@@ -2326,11 +2410,11 @@ class MainWindow(QMainWindow):
         lay.addStretch()
 
         self._msg_label = QLabel("消息: 0")
-        self._msg_label.setStyleSheet("font-size:11px; color:#9ca3af;")
+        self._msg_label.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
         lay.addWidget(self._msg_label)
 
         self._mode_label = QLabel("")
-        self._mode_label.setStyleSheet("font-size:11px; color:#9ca3af;")
+        self._mode_label.setStyleSheet(f"font-size:11px; color:{theme.C('text_secondary')};")
         lay.addWidget(self._mode_label)
 
         return bar
@@ -2484,11 +2568,33 @@ class MainWindow(QMainWindow):
         self._recording = not self._recording
         self._worker.set_recording(self._recording)
         self._rec_btn.setText("停止记录" if self._recording else "开始记录")
-        self._rec_btn.setStyleSheet(
-            "QPushButton{background:#30d158;color:#fff;border-radius:8px;padding:6px 12px;}"
-            if self._recording
-            else "QPushButton{background:#8a9099;color:#fff;border-radius:8px;padding:6px 12px;}"
-        )
+        # 记录中=主色实底，暂停中=次要按钮，靠 objectName 让样式表接管。
+        self._rec_btn.setObjectName("btnOn" if self._recording else "btnGhost")
+
+    def _toggle_theme(self) -> None:
+        """切主题：重建应用样式表，再把内联样式和手绘控件跟着换一遍。"""
+        new_name = theme.toggle_theme(QApplication.instance(), self)
+        self._theme_name = new_name
+        # 按钮文字是「你要切到哪个」，不是「你现在是哪个」。
+        self._theme_btn.setText("深色" if new_name == "light" else "浅色")
+        self._persist_theme(new_name)
+
+    def _persist_theme(self, name: str) -> None:
+        """把主题写回 config.json；文件动不了就只活在当前会话。"""
+        self._config.setdefault("ui", {})["theme"] = name
+        if not self._config_path:
+            return
+        try:
+            with open(self._config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            return
+        cfg.setdefault("ui", {})["theme"] = name
+        try:
+            with open(self._config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
 
     def _open_history(self) -> None:
         dlg = HistoryDialog(self._db, self)

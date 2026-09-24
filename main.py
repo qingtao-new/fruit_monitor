@@ -43,12 +43,15 @@ def main() -> int:
     args = parse_args()
     use_simulator = not args.mqtt or args.simulator
     config = load_config(args.config)
+    config["_config_path"] = str(args.config)
     db_path = args.db or resolve_db_path(config, args.config)
     db = Database(db_path)
 
     app = QApplication(sys.argv)
     app.setApplicationName("Fruit Monitor")
-    theme.apply(app)
+    # 主题记在 config.json 的 ui.theme，缺省走浅色 SaaS。
+    theme_name = config.get("ui", {}).get("theme", "light")
+    theme.apply_theme(app, theme_name)
 
     worker: QThread
     if use_simulator:
