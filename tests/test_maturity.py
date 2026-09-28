@@ -12,6 +12,7 @@ from maturity import (
     estimate_maturity,
     level_label,
     maturity_level_index,
+    progress_uncertainty,
     spectrum_prediction,
 )
 from protocol import ImpedanceSpectrum, SpectrumPoint
@@ -112,6 +113,43 @@ class HarvestTest(unittest.TestCase):
         result = estimate_maturity(1500.0, timestamp=1700000000, node_id="LORA_NODE_01")
         self.assertEqual(result.timestamp, 1700000000)
         self.assertEqual(result.node_id, "LORA_NODE_01")
+
+
+class UncertaintyTest(unittest.TestCase):
+    """progress_uncertainty 是统计意义上的不确定度，与 confidence 不同。"""
+
+    def test_zero_spread_means_zero_sigma(self):
+        _, sigma = progress_uncertainty(1500.0, 0.0)
+        self.assertEqual(sigma, 0.0)
+
+    def test_sigma_scales_linearly_with_spread(self):
+        span = MAGNITUDE_HIGH - MAGNITUDE_LOW
+        _, s1 = progress_uncertainty(1500.0, 100.0)
+        _, s2 = progress_uncertainty(1500.0, 200.0)
+        self.assertAlmostEqual(s1, 100.0 / span, places=9)
+        self.assertAlmostEqual(s2, 200.0 / span, places=9)
+
+    def test_same_progress_as_estimate_maturity(self):
+        prog, _ = progress_uncertainty(1500.0, 50.0)
+        self.assertAlmostEqual(prog, estimate_maturity(1500.0).maturity, places=6)
+
+    def test_interval_not_clipped(self):
+        # 裁剪 sigma 会把截断误当成精度，必须返回未裁剪的传播值
+        _, sigma = progress_uncertainty(MAGNITUDE_HIGH, 1e6)
+        self.assertGreater(sigma, 1.0)
+
+    def test_invalid_calibration_rejected(self):
+        with self.assertRaises(ValueError):
+            progress_uncertainty(1000.0, 10.0,
+                                 magnitude_high=1000.0, magnitude_low=1000.0)
+
+    def test_confidence_is_not_a_confidence_interval(self):
+        """heuristic confidence 与统计 sigma 是两回事，互不推导。"""
+        _, sigma = progress_uncertainty(1500.0, 0.0)
+        conf = estimate_maturity(1500.0, spread_ratio=0.0).confidence
+        self.assertEqual(sigma, 0.0)          # 测量无离散
+        self.assertGreater(conf, 0.5)         # 但启发式照样给高分
+        self.assertNotAlmostEqual(sigma, 1.0 - conf, places=3)
 
 
 class SpectrumPredictionTest(unittest.TestCase):

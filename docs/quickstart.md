@@ -40,17 +40,30 @@ cd E:\opencode\fruit_monitor
 - 成熟度面板：置信度仪表、四阶段步骤条、预计采摘日期
 - 录制开关、轮次选择、历史查询、导出等入口
 
-如果你只想看分析结果，可以直接跑分析脚本：
+如果你想看分析结果，直接跑分析脚本——**它必须带真实标签**：
 
 ```powershell
-.\.venv\Scripts\python.exe analysis.py --gateway GW_001 --node LORA_NODE_01 --model centroid
+# 先打出库中可用的谱，用来填标签表
+.\.venv\Scripts\python.exe analysis.py --gateway GW_001 --node LORA_NODE_01 --dump-samples
+
+# 填好 labels.csv 后再跑评估
+.\.venv\Scripts\python.exe analysis.py --gateway GW_001 --node LORA_NODE_01 --labels labels.csv
 ```
 
 常用参数：
-- `--model threshold`
-- `--model centroid`
+- `--labels labels.csv`（**必填**，缺了会拒绝出数）
+- `--model baseline logreg rf`（缺省跑全部）
+- `--folds 5`（受独立样本数限制，会自动下调）
 - `--limit 200`
 - `--output result.json`
+
+没有标签想先看管线通不通，用带 `SIMULATED` 水印的实验脚本：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_experiment.py
+```
+
+方法学与限制见 [methodology.md](methodology.md)。
 
 ## 6. 常见问题
 

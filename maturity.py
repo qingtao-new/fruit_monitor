@@ -61,7 +61,19 @@ def estimate_maturity(
 
     ``magnitude_high`` / ``magnitude_low`` 是"未成熟起点"和"过熟终点"的
     有效频段 |Z| 均值，需要按所用硬件标定一次；当前默认值对应
-    ``mqtt_client.build_sweep_round`` 的双参 Cole-Cole 仿真模型。
+    ``mqtt_client.build_sweep_round`` 的双参 Cole-Cole 仿真模型，
+    **尚未用真机数据重新标定**——真机中位数落在该区间之外时
+    ``progress`` 会一直钳在 0。
+
+    关于 ``confidence``（**务必按此理解，不要当统计置信度引用**）：
+
+    它是"落点离等级边界多远"的**启发式**，叠加频段内离散度的惩罚项。
+    它**没有**用到测量方差、模型残差或样本量，因此不是统计意义上的
+    置信度，也不能解释为"这个数有 80% 概率是对的"。
+
+    需要真正的不确定度时用 :func:`progress_uncertainty`——它把频段内
+    |Z| 的离散度线性传播成 progress 的 1σ 区间；若已有 Cole-Cole 拟合，
+    优先用 :func:`spectral_fit.fit_cole_cole` 返回的参数 95% CI。
     """
     if magnitude_high <= magnitude_low:
         raise ValueError("magnitude_high must exceed magnitude_low")
@@ -73,6 +85,8 @@ def estimate_maturity(
     band = progress * len(MATURITY_LEVELS) - index
     edge_distance = min(band, 1.0 - band) / 0.5
 
+    # 启发式：越靠近等级边界越保守，频段离散度超基线才扣分。
+    # 这是"离边界多远"的代理量，不是统计置信度——见本函数 docstring。
     confidence = MIN_CONFIDENCE + (MAX_CONFIDENCE - MIN_CONFIDENCE) * edge_distance
     excess_spread = max(0.0, spread_ratio - spread_ratio_ref)
     if excess_spread > 0:
@@ -96,6 +110,41 @@ def estimate_maturity(
         confidence=round(confidence, 4),
         round_id=round_id,
     )
+
+
+def progress_uncertainty(
+    magnitude_mean: float,
+    magnitude_std: float,
+    *,
+    magnitude_high: float = MAGNITUDE_HIGH,
+    magnitude_low: float = MAGNITUDE_LOW,
+) -> tuple[float, float]:
+    """把有效频段内 |Z| 的离散度线性传播成 progress 的 1σ 不确定度。
+
+    线性变换 ``progress = (high - |Z|) / (high - low)`` 下，自变量的标准差
+    按比例传递::
+
+        sigma_progress = sigma_magnitude / (magnitude_high - magnitude_low)
+
+    返回 ``(progress, sigma_progress)``，``progress`` 已裁剪到 [0,1]，
+    ``sigma`` 是**未裁剪**的原始传播值——裁剪会让区间看着变窄，
+    那是把截断误当成精度。
+
+    这是最低限度的不确定度：只计入了"同一条谱内各频点的离散"，
+    没有计入标定端点本身的误差、日间漂移或模型失配。
+    需要完整不确定度请用 :func:`spectral_fit.fit_cole_cole` 的参数 CI。
+    """
+    span = magnitude_high - magnitude_low
+    if span <= 0:
+        raise ValueError("magnitude_high must exceed magnitude_low")
+    result = estimate_maturity(
+        magnitude_mean,
+        magnitude_high=magnitude_high,
+        magnitude_low=magnitude_low,
+        spread_ratio=0.0,
+    )
+    sigma = abs(magnitude_std) / abs(span)
+    return result.maturity, float(sigma)
 
 
 def level_label(level_key: Optional[str]) -> str:

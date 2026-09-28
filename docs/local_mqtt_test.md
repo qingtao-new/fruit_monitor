@@ -78,14 +78,20 @@ cd E:\opencode\fruit_monitor
 ## 5. 运行分析预测
 
 ```powershell
-.\.venv\Scripts\python.exe analysis.py --gateway GW_001 --node LORA_NODE_01 --model knn
+# 打出可用谱的 sample_id，用来填标签表
+.\.venv\Scripts\python.exe analysis.py --gateway GW_001 --node LORA_NODE_01 --dump-samples
+
+# 有真实标签后
+.\.venv\Scripts\python.exe analysis.py --gateway GW_001 --node LORA_NODE_01 --labels labels.csv
 ```
 
-常用模型：
+模型名与 `maturity_ml.AVAILABLE_MODELS` 一致：
 
-- `threshold`
-- `centroid`
-- `knn`
+- 分类：`baseline` `logreg` `ridge_clf` `rf`
+- 回归：`baseline` `ridge` `rf`
+
+`--labels` 是**必填**的。旧版可不给标签就跑，靠时间顺序编造标签，
+那是循环论证，已移除。详见 [methodology.md](methodology.md)。
 
 ## 6. 协议约定
 

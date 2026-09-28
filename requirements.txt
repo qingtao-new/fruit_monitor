@@ -3,3 +3,9 @@ PyQtGraph>=0.13.7
 paho-mqtt>=2.1.0
 numpy>=1.26.0
 pandas>=2.1.0
+# spectral_fit 的非线性最小二乘拟合
+scipy>=1.11.0
+# maturity_ml 的分组交叉验证、预处理 Pipeline 与指标
+scikit-learn>=1.3.0
+# migration/ 的绘图与离线分析出图
+matplotlib>=3.7.0
