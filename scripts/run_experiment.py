@@ -278,10 +278,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ---- 5. 相对基线 ----
     if "baseline" in outcomes and len(outcomes) > 1:
         base = outcomes["baseline"].aggregate
-        print(f"\n相对基线（Dummy）提升——基线 accuracy="
-              f"{base.get('accuracy', float('nan')):.3f}"
-              f"  / r2={base.get('r2', float('nan')):.3f}：")
         target = "accuracy" if ds.kind == "classification" else "r2"
+        # 只打印当前任务适用的那个指标，别在分类里挂出 r2=nan
+        head = (f"accuracy={base.get('accuracy', float('nan')):.3f}"
+                if ds.kind == "classification"
+                else f"r2={base.get('r2', float('nan')):.3f}")
+        print(f"\n相对基线（Dummy）提升——基线 {head}：")
         if target in base:
             for name, out in outcomes.items():
                 if name == "baseline":
@@ -293,7 +295,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ---- 6. 不变量断言 ----
     print_header("方法学不变量自检")
     _check_no_group_leakage(outcomes, ds)
-    _check_baseline_present(outcomes, ds.kind)
+    _check_baseline_present(outcomes, ds)
 
     if not outcomes:
         raise SystemExit("没有任何模型跑成功")
@@ -351,16 +353,20 @@ def _check_no_group_leakage(outcomes: dict, ds: Dataset) -> None:
           f"同一只果从未同时出现在训练与测试")
 
 
-def _check_baseline_present(outcomes: dict, kind: str) -> None:
+def _check_baseline_present(outcomes: dict, ds) -> None:
     if "baseline" not in outcomes:
         print("[!!] 没有跑基线模型 —— 指标缺少参照系，"
               "不要单独解读 accuracy")
         return
     base = outcomes["baseline"].aggregate
-    if kind == "classification":
-        acc = base.get("accuracy", 0.0)
-        print(f"[OK] 基线 accuracy={acc:.3f}"
-              f"（四分类理论值 0.25）—— 低于它的模型等于没有信息")
+    if ds.kind == "classification":
+        # 类数从数据实际数出来，别把"四分类"写死——
+        # 换标签文件后类数可能变，理论值也就不是 0.25
+        n_classes = len({str(v) for v in ds.y})
+        chance = 1.0 / n_classes if n_classes else float("nan")
+        print(f"[OK] 基线 accuracy={base.get('accuracy', 0.0):.3f}"
+              f"（{n_classes} 分类随机猜测的理论值 {chance:.3f}）"
+              f"—— 低于它的模型等于没有信息")
     else:
         print(f"[OK] 基线 r2={base.get('r2', float('nan')):.3f}"
               f"（恒定预测的 r2 为 0）")
