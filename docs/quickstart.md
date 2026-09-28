@@ -152,3 +152,86 @@ cd E:\opencode\fruit_monitor
 `config/config.json` 里 `maturity` 段控制成熟度标定的两端 |Z| 值和
 有效频段；`assembler` 段控制扫频分包的超时时间和并发扫描数上限。
 改配置不用重新编译。
+
+## 12. 自动存档与上报 GitHub
+
+### 12.1 它是怎么跑起来的
+
+**不是 Windows 计划任务**——注册计划任务需要管理员权限，这台机器没有。改用
+启动文件夹常驻循环：`scripts/git_archive_loop.cmd` 放在
+
+```
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
+```
+
+开机自动起来，每 30 分钟调一次 `scripts/git_archive.py`，日志追加到
+`logs/archive.stdout.log`。
+
+### 12.2 一轮做四件事
+
+1. `git status --porcelain` 为空就直接跳过，**不产生空提交**
+2. `git add -A`，然后扫暂存内容里的明文凭据（`WIFI_PASSWORD`、`password=`、
+   `api_key`、`PRIVATE KEY`…）
+   - 命中就 `git reset` 中止，改动留在工作区等人处理 —— 上次就是靠这条把固件里的
+     WiFi 密码拦下来的
+3. 提交成 `chore(archive): 自动存档 <时间> (N files)`
+4. push 到 `origin`
+
+**push 失败只记一行日志、返回 0，绝不影响本地存档。** github.com 的 443 在这台机器
+上时通时断（实测过 `Connection was reset` → `port 443 超时` → 自己恢复），下一轮
+30 分钟自动重试。网络抖一下不该打断归档节奏，本地和远端各留一份就不怕丢。
+
+凭据命中或提交失败时**不 push**——问题还在工作区，推上去只会把问题搬到 GitHub。
+
+### 12.3 看日志
+
+`logs/archive.log`：
+
+```
+2026-09-28 14:28:10  push failed: fatal: unable to access 'https://github.com/...' Recv failure: Connection was reset
+2026-09-28 14:43:11  committed 211af29  1 files
+2026-09-28 14:43:16  pushed origin/main
+```
+
+`skip: nothing to commit` 是正常的（本轮没改动）。
+
+### 12.4 远端
+
+```powershell
+git remote -v
+# origin  https://github.com/qingtao-new/fruit_monitor.git   (push 用)
+# ssh     git@github.com:qingtao-new/fruit_monitor.git       (备胎，暂时没启用)
+```
+
+验证是否同步：`git ls-remote origin main` 应当等于 `git rev-parse HEAD`。
+
+### 12.5 SSH 备胎（已配好，暂时摘下）
+
+已经就位的：`~/.ssh/id_ed25519` 密钥、`~/.ssh/config`（含 `BatchMode yes` 和
+`StrictHostKeyChecking accept-new`，保证非交互运行永不弹提示卡死）、remote `ssh`。
+
+**摘下的原因**：公钥还没登记到 GitHub，试 SSH 只会白等一次连接再记一条
+`Permission denied (publickey)`，所以 `PUSH_REMOTES` 里暂时只有 `origin`。
+
+要启用，三步：
+
+1. 打开 https://github.com/settings/keys → **New SSH key**
+2. Key 框粘贴 `~/.ssh/id_ed25519.pub` 的内容
+3. `scripts/git_archive.py` 改一行：
+
+```python
+PUSH_REMOTES = ("origin", "ssh")
+```
+
+`~/.ssh/config` 里备了两条路：`github.com` 走 22 端口，`github443` 走
+`ssh.github.com:443`（22 被封时用，把 remote 换成 `git@github443:...` 即可）。
+
+### 12.6 HTTPS 凭据
+
+```powershell
+git config --get credential.helper   # manager = Windows 凭据管理器
+```
+
+首次 https push 会弹窗口：**用户名填 GitHub 用户名，密码栏填 PAT**（开了 2FA
+的账号不能用登录密码）。PAT 建 fine-grained、只授权这一个仓库、只需要
+**Contents: Read and write**。填完就缓存了，之后 30 分钟一轮不再问。
