@@ -21,9 +21,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 LOG = REPO / "logs" / "archive.log"
-# 上报顺序：https 优先（不用 ssh 环境），连不上降级到 ssh。名字对得上
-# `git remote -v` 里的 remote，没配的会被自动跳过。
-PUSH_REMOTES = ("origin", "ssh")
+# 上报顺序：https 优先。`ssh` 这条路已经配好 remote + ~/.ssh/config，但公钥
+# 还没登记到 GitHub，试它只会白等一次连接再记一条 Permission denied，
+# 所以暂时摘掉；到 GitHub → Settings → SSH and GPG keys 贴上
+# ~/.ssh/id_ed25519.pub 之后，把它加回元组即可。
+# 名字对得上 `git remote -v` 里的 remote，没配的会被自动跳过。
+PUSH_REMOTES = ("origin",)
 
 # 命中任意一条就中止提交。占位符和本地配置不算凭据。
 # 引号可有可无：C++ 是 PASSWORD = "..."，JSON 是 "password": "..."。
