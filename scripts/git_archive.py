@@ -21,7 +21,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 LOG = REPO / "logs" / "archive.log"
-REMOTE = "origin"
+# 上报顺序：https 优先（不用 ssh 环境），连不上降级到 ssh。名字对得上
+# `git remote -v` 里的 remote，没配的会被自动跳过。
+PUSH_REMOTES = ("origin", "ssh")
 
 # 命中任意一条就中止提交。占位符和本地配置不算凭据。
 # 引号可有可无：C++ 是 PASSWORD = "..."，JSON 是 "password": "..."。
@@ -107,24 +109,32 @@ def archive_commit() -> tuple[int, bool]:
 
 
 def push_report(new_commit: bool) -> int:
-    """把本地分支推到 origin（上报）。永远返回 0。
+    """按顺序把本地分支推到多个远端，全部失败也只记日志。永远返回 0。
 
-    没配远端就安静跳过；断网、没登录、被拒也都只记一行日志。上报失败
-    绝不能连累本地存档——计划任务每 30 分钟跑一次，网络抖一下而已，
-    下一轮自己会重试。
+    顺序：先走 https（origin），连不上再降级到 ssh。github.com 的 443 这台机器
+    上时通时断，SSH 22 是另一条路，值得留着兜底。
+    没配远端就安静跳过；断网、没登录、被拒都只记一行。上报失败绝不能连累
+    本地存档——计划任务每 30 分钟跑一次，网络抖一下而已，下一轮自己会重试。
     """
     if not run(["git", "remote"]):
         return 0
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    push = subprocess.run(["git", "push", REMOTE, branch], cwd=REPO,
-                          capture_output=True, text=True, encoding="utf-8",
-                          errors="replace")
-    if push.returncode != 0:
-        note("push failed: " + ((push.stdout + push.stderr).strip() or
-                                 f"exit {push.returncode}")[:300])
-        return 0
-    if new_commit:
-        note(f"pushed {REMOTE}/{branch}")
+
+    errors: list[str] = []
+    for remote in PUSH_REMOTES:
+        if not run(["git", "remote", "get-url", remote]):
+            continue                      # 这个远端没配，换下一个
+        push = subprocess.run(["git", "push", remote, branch], cwd=REPO,
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace")
+        if push.returncode == 0:
+            if new_commit:
+                note(f"pushed {remote}/{branch}")
+            return 0
+        message = (push.stdout + push.stderr).strip() or f"exit {push.returncode}"
+        errors.append(f"{remote}: {message}")
+
+    note("push failed: " + " | ".join(errors)[:400])
     return 0
 
 
